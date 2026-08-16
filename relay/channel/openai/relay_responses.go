@@ -112,6 +112,27 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			sr.Error(err)
 			return
 		}
+		// Ensure output_tokens_details is populated before the completed event is
+		// re-serialized and sent to the client. Some upstreams (e.g. Moonshot/Kimi)
+		// report reasoning_tokens at the top level of usage rather than inside
+		// output_tokens_details.
+		if streamResponse.Type == "response.completed" || streamResponse.Type == "response.done" {
+			if streamResponse.Response != nil && streamResponse.Response.Usage != nil {
+				eventUsage := streamResponse.Response.Usage
+				if eventUsage.OutputTokensDetails == nil {
+					reasoningTokens := eventUsage.ReasoningTokens
+					if reasoningTokens == 0 {
+						reasoningTokens = eventUsage.CompletionTokenDetails.ReasoningTokens
+					}
+					if reasoningTokens != 0 {
+						eventUsage.OutputTokensDetails = &dto.OutputTokenDetails{
+							ReasoningTokens: reasoningTokens,
+						}
+					}
+				}
+			}
+		}
+
 		// Re-serialize to ensure created_at is always a clean integer (not float)
 		// and usage includes output_tokens_details with reasoning_tokens.
 		reSerialized, err := common.Marshal(streamResponse)
@@ -146,12 +167,6 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 					if rt != 0 {
 						usage.ReasoningTokens = rt
 						usage.CompletionTokenDetails.ReasoningTokens = rt
-						// Ensure the event sent to client has output_tokens_details
-						if streamResponse.Response.Usage.OutputTokensDetails == nil {
-							streamResponse.Response.Usage.OutputTokensDetails = &dto.OutputTokenDetails{
-								ReasoningTokens: rt,
-							}
-						}
 					}
 				}
 				if !imageCommitted {
