@@ -138,3 +138,54 @@ func mustResponsesEventsFromChatChunk(t *testing.T, state *ChatToResponsesStream
 	require.NoError(t, err)
 	return events
 }
+
+// Upstream OpenAI always emits output_tokens_details in Responses usage
+// (reasoning_tokens may be 0) and strict clients such as Codex require the
+// field to exist, so UsageFromChatUsage must populate it even when the chat
+// usage carries no reasoning tokens at all (e.g. Kimi local counting).
+func TestUsageFromChatUsageAlwaysEmitsOutputTokensDetails(t *testing.T) {
+	tests := []struct {
+		name          string
+		src           dto.Usage
+		wantReasoning int
+	}{
+		{
+			name:          "top-level reasoning tokens",
+			src:           dto.Usage{PromptTokens: 3, CompletionTokens: 5, TotalTokens: 8, ReasoningTokens: 2},
+			wantReasoning: 2,
+		},
+		{
+			name:          "completion tokens details fallback",
+			src:           dto.Usage{PromptTokens: 3, CompletionTokens: 5, TotalTokens: 8, CompletionTokenDetails: dto.OutputTokenDetails{ReasoningTokens: 4}},
+			wantReasoning: 4,
+		},
+		{
+			name:          "no reasoning tokens still emits zero details",
+			src:           dto.Usage{PromptTokens: 3, CompletionTokens: 5, TotalTokens: 8},
+			wantReasoning: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			usage := UsageFromChatUsage(&tt.src)
+			require.NotNil(t, usage)
+			require.NotNil(t, usage.OutputTokensDetails,
+				"output_tokens_details must always be present")
+			assert.Equal(t, tt.wantReasoning, usage.OutputTokensDetails.ReasoningTokens)
+			assert.Equal(t, tt.wantReasoning, usage.ReasoningTokens)
+		})
+	}
+}
+
+func TestUsageFromChatUsagePreservesExistingOutputTokensDetails(t *testing.T) {
+	src := &dto.Usage{
+		PromptTokens:        3,
+		CompletionTokens:    5,
+		TotalTokens:         8,
+		OutputTokensDetails: &dto.OutputTokenDetails{ReasoningTokens: 7},
+	}
+	usage := UsageFromChatUsage(src)
+	require.NotNil(t, usage)
+	require.NotNil(t, usage.OutputTokensDetails)
+	assert.Equal(t, 7, usage.OutputTokensDetails.ReasoningTokens)
+}

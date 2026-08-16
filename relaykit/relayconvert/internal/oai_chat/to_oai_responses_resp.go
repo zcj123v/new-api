@@ -157,7 +157,11 @@ func UsageFromChatUsage(src *dto.Usage) *dto.Usage {
 		reasoningTokens = src.CompletionTokenDetails.ReasoningTokens
 	}
 	usage.ReasoningTokens = reasoningTokens
-	if reasoningTokens != 0 {
+	// output_tokens_details is always emitted (reasoning_tokens may be 0) to
+	// match upstream OpenAI behavior; strict Responses clients require the field.
+	if src.OutputTokensDetails != nil {
+		usage.OutputTokensDetails = src.OutputTokensDetails
+	} else {
 		usage.OutputTokensDetails = &dto.OutputTokenDetails{
 			ReasoningTokens: reasoningTokens,
 		}
