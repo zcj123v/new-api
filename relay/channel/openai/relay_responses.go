@@ -34,13 +34,19 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
 
-	// Ensure output_tokens_details is populated for Responses API compatibility.
-	// Some upstreams (e.g. Moonshot/Kimi) report reasoning_tokens at the top
-	// level of usage rather than inside output_tokens_details.
+	// Ensure output_tokens_details is present for Responses API compatibility.
+	// Upstream OpenAI always emits the field (reasoning_tokens may be 0), and
+	// strict clients require it. Some upstreams (e.g. Moonshot/Kimi) report
+	// reasoning_tokens at the top level of usage rather than inside
+	// output_tokens_details.
 	if responsesResponse.Usage != nil {
-		if responsesResponse.Usage.OutputTokensDetails == nil && responsesResponse.Usage.ReasoningTokens != 0 {
+		if responsesResponse.Usage.OutputTokensDetails == nil {
+			reasoningTokens := responsesResponse.Usage.ReasoningTokens
+			if reasoningTokens == 0 {
+				reasoningTokens = responsesResponse.Usage.CompletionTokenDetails.ReasoningTokens
+			}
 			responsesResponse.Usage.OutputTokensDetails = &dto.OutputTokenDetails{
-				ReasoningTokens: responsesResponse.Usage.ReasoningTokens,
+				ReasoningTokens: reasoningTokens,
 			}
 		}
 	}
@@ -112,10 +118,11 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			sr.Error(err)
 			return
 		}
-		// Ensure output_tokens_details is populated before the completed event is
-		// re-serialized and sent to the client. Some upstreams (e.g. Moonshot/Kimi)
-		// report reasoning_tokens at the top level of usage rather than inside
-		// output_tokens_details.
+		// Ensure output_tokens_details is present before the completed event is
+		// re-serialized and sent to the client. Upstream OpenAI always emits the
+		// field (reasoning_tokens may be 0), and strict clients require it. Some
+		// upstreams (e.g. Moonshot/Kimi) report reasoning_tokens at the top level
+		// of usage rather than inside output_tokens_details.
 		if streamResponse.Type == "response.completed" || streamResponse.Type == "response.done" {
 			if streamResponse.Response != nil && streamResponse.Response.Usage != nil {
 				eventUsage := streamResponse.Response.Usage
@@ -124,10 +131,8 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 					if reasoningTokens == 0 {
 						reasoningTokens = eventUsage.CompletionTokenDetails.ReasoningTokens
 					}
-					if reasoningTokens != 0 {
-						eventUsage.OutputTokensDetails = &dto.OutputTokenDetails{
-							ReasoningTokens: reasoningTokens,
-						}
+					eventUsage.OutputTokensDetails = &dto.OutputTokenDetails{
+						ReasoningTokens: reasoningTokens,
 					}
 				}
 			}
