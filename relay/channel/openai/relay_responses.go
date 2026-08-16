@@ -34,32 +34,17 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
 
-	// Ensure output_tokens_details is present for Responses API compatibility.
-	// Upstream OpenAI always emits the field (reasoning_tokens may be 0), and
-	// strict clients require it. Some upstreams (e.g. Moonshot/Kimi) report
-	// reasoning_tokens at the top level of usage rather than inside
-	// output_tokens_details.
-	if responsesResponse.Usage != nil {
-		if responsesResponse.Usage.OutputTokensDetails == nil {
-			reasoningTokens := responsesResponse.Usage.ReasoningTokens
-			if reasoningTokens == 0 {
-				reasoningTokens = responsesResponse.Usage.CompletionTokenDetails.ReasoningTokens
-			}
-			responsesResponse.Usage.OutputTokensDetails = &dto.OutputTokenDetails{
-				ReasoningTokens: reasoningTokens,
-			}
-		}
+	// 默认原始透传响应体：typed struct 重序列化会丢失上游字段（如
+	// custom_tool_call 的 input、reasoning 的 encrypted_content）。仅在缺
+	// output_tokens_details 时做 map 级补丁（保留所有未知字段）。
+	// Some upstreams (e.g. Moonshot/Kimi) report reasoning_tokens at the top
+	// level of usage rather than inside output_tokens_details, while strict
+	// clients require the field.
+	outBody := responseBody
+	if responsesResponse.Usage != nil && responsesResponse.Usage.OutputTokensDetails == nil {
+		outBody = patchResponsesBodyUsage(responseBody)
 	}
-
-	// Re-serialize to ensure created_at is always a clean integer (not float)
-	// and usage includes output_tokens_details with reasoning_tokens.
-	reSerializedBody, err := common.Marshal(responsesResponse)
-	if err != nil {
-		// Fallback to raw body if re-serialization fails
-		service.IOCopyBytesGracefully(c, resp, responseBody)
-	} else {
-		service.IOCopyBytesGracefully(c, resp, reSerializedBody)
-	}
+	service.IOCopyBytesGracefully(c, resp, outBody)
 
 	// compute usage
 	usage := dto.Usage{}
@@ -114,39 +99,24 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		// 检查当前数据是否包含 completed 状态和 usage 信息
 		var streamResponse dto.ResponsesStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
-			logger.LogError(c, "failed to unmarshal stream response: "+err.Error())
-			sr.Error(err)
+			// 解析失败时原样透传而不是丢事件（例如 created_at 为浮点的上游），
+			// 仅无法做 usage 记账与补丁。
+			logger.LogError(c, "failed to unmarshal stream response, relay raw data: "+err.Error())
+			sendResponsesStreamData(c, streamResponse, patchResponsesStreamEventUsage(data))
 			return
 		}
-		// Ensure output_tokens_details is present before the completed event is
-		// re-serialized and sent to the client. Upstream OpenAI always emits the
-		// field (reasoning_tokens may be 0), and strict clients require it. Some
-		// upstreams (e.g. Moonshot/Kimi) report reasoning_tokens at the top level
-		// of usage rather than inside output_tokens_details.
+		// 事件默认原始透传：typed struct 重序列化会丢失上游字段（如
+		// custom_tool_call 的 input、reasoning 的 encrypted_content、
+		// sequence_number），导致严格客户端（如 Codex）拿不到工具调用。
+		// 仅 completed/done 事件在缺 output_tokens_details 时做 map 级补丁。
+		// Some upstreams (e.g. Moonshot/Kimi) report reasoning_tokens at the top
+		// level of usage rather than inside output_tokens_details, while strict
+		// clients require the field.
+		sendData := data
 		if streamResponse.Type == "response.completed" || streamResponse.Type == "response.done" {
-			if streamResponse.Response != nil && streamResponse.Response.Usage != nil {
-				eventUsage := streamResponse.Response.Usage
-				if eventUsage.OutputTokensDetails == nil {
-					reasoningTokens := eventUsage.ReasoningTokens
-					if reasoningTokens == 0 {
-						reasoningTokens = eventUsage.CompletionTokenDetails.ReasoningTokens
-					}
-					eventUsage.OutputTokensDetails = &dto.OutputTokenDetails{
-						ReasoningTokens: reasoningTokens,
-					}
-				}
-			}
+			sendData = patchResponsesStreamEventUsage(data)
 		}
-
-		// Re-serialize to ensure created_at is always a clean integer (not float)
-		// and usage includes output_tokens_details with reasoning_tokens.
-		reSerialized, err := common.Marshal(streamResponse)
-		if err != nil {
-			// Fallback to raw data if re-serialization fails
-			sendResponsesStreamData(c, streamResponse, data)
-		} else {
-			sendResponsesStreamData(c, streamResponse, string(reSerialized))
-		}
+		sendResponsesStreamData(c, streamResponse, sendData)
 		switch streamResponse.Type {
 		case "response.completed", "response.done":
 			if streamResponse.Response != nil {
@@ -238,4 +208,73 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	helper.Done(c)
 
 	return usage, nil
+}
+
+// patchResponsesUsageDoc patches a decoded response object in place: rounds
+// created_at to an integer and populates usage.output_tokens_details when the
+// upstream omitted it. Unknown fields are preserved because it operates on the
+// raw map.
+func patchResponsesUsageDoc(resp map[string]interface{}) {
+	if v, ok := resp["created_at"].(float64); ok {
+		resp["created_at"] = int64(v)
+	}
+	usage, ok := resp["usage"].(map[string]interface{})
+	if !ok || usage == nil {
+		return
+	}
+	if _, exists := usage["output_tokens_details"]; exists {
+		return
+	}
+	reasoningTokens := 0
+	if v, ok := usage["reasoning_tokens"].(float64); ok {
+		reasoningTokens = int(v)
+	}
+	if reasoningTokens == 0 {
+		if details, ok := usage["completion_tokens_details"].(map[string]interface{}); ok {
+			if v, ok := details["reasoning_tokens"].(float64); ok {
+				reasoningTokens = int(v)
+			}
+		}
+	}
+	usage["output_tokens_details"] = map[string]interface{}{
+		"reasoning_tokens": reasoningTokens,
+	}
+}
+
+// patchResponsesBodyUsage patches a non-streaming Responses response body.
+// Returns the original body when it cannot be parsed or re-serialized.
+func patchResponsesBodyUsage(body []byte) []byte {
+	var doc map[string]interface{}
+	if err := common.Unmarshal(body, &doc); err != nil {
+		return body
+	}
+	patchResponsesUsageDoc(doc)
+	patched, err := common.Marshal(doc)
+	if err != nil {
+		return body
+	}
+	return patched
+}
+
+// patchResponsesStreamEventUsage patches a response.completed/done stream
+// event. Returns the original data when it cannot be parsed or re-serialized.
+func patchResponsesStreamEventUsage(data string) string {
+	var doc map[string]interface{}
+	if err := common.UnmarshalJsonStr(data, &doc); err != nil {
+		return data
+	}
+	eventType, _ := doc["type"].(string)
+	if eventType != "response.completed" && eventType != "response.done" {
+		return data
+	}
+	resp, ok := doc["response"].(map[string]interface{})
+	if !ok {
+		return data
+	}
+	patchResponsesUsageDoc(resp)
+	patched, err := common.Marshal(doc)
+	if err != nil {
+		return data
+	}
+	return string(patched)
 }
