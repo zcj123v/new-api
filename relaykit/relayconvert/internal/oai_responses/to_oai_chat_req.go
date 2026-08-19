@@ -419,14 +419,12 @@ func responsesRequestToolsToChat(raw json.RawMessage) ([]dto.ToolCallRequest, er
 			continue
 		}
 
-		rawTool, err := kitutil.Marshal(tool)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, dto.ToolCallRequest{
-			Type:   toolType,
-			Custom: rawTool,
-		})
+		// 其余 Responses 专属类型（tool_search、web_search、mcp、
+		// image_generation、code_interpreter 等）在 chat 上游没有等价物，
+		// 原样透传只会被上游拒绝（unknown tool type: ...），直接丢弃。
+		// tool_search 由客户端本地执行，丢弃不影响已展平工具的使用。
+		kitutil.LogInfo(fmt.Sprintf("responses->chat: dropping unsupported tool type %q (name=%q)",
+			toolType, kitutil.Interface2String(tool["name"])))
 	}
 	return out, nil
 }

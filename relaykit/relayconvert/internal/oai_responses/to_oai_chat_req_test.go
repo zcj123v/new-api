@@ -475,3 +475,22 @@ func TestResponsesRequestToChatCompletionsRequestNamespaceAndAdditionalTools(t *
 	})
 	assert.ElementsMatch(t, []string{"nested_custom", "exec_custom"}, collected)
 }
+
+// tool_search / web_search 等 Responses 专属类型在 chat 上游无等价物，
+// 必须丢弃而不是透传（否则上游 400 unknown tool type）。
+func TestResponsesRequestToChatCompletionsRequestDropsUnsupportedToolTypes(t *testing.T) {
+	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+		Model: "gpt-test",
+		Input: mustRawMessage(t, "hi"),
+		Tools: mustRawMessage(t, []map[string]any{
+			{"type": "tool_search"},
+			{"type": "web_search"},
+			{"type": "image_generation"},
+			{"type": "function", "name": "exec", "parameters": map[string]any{"type": "object"}},
+		}),
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Tools, 1)
+	assert.Equal(t, "function", got.Tools[0].Type)
+	assert.Equal(t, "exec", got.Tools[0].Function.Name)
+}
