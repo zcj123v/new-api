@@ -345,6 +345,8 @@ type ResponsesOutput struct {
 	Arguments json.RawMessage          `json:"arguments,omitempty"`
 	// Input 承载 custom_tool_call 的 freeform 输入（Codex apply_patch 等）。
 	Input string `json:"input,omitempty"`
+	// Execution 标记 tool_search_call 由客户端执行（"client"）。
+	Execution string `json:"execution,omitempty"`
 }
 
 // ArgumentsString returns function call arguments in the string form expected by Chat Completions.

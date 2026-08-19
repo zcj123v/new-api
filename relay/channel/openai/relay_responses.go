@@ -100,6 +100,10 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	// 一直等待终止事件而表现为"卡死"。流结束时若未见到终止事件，兜底合成
 	// response.incomplete 让客户端干净地失败并重试。
 	terminalSeen := false
+	// contentSeen 记录是否收到过除 created/in_progress 外的任何实质事件；
+	// EOF 兜底时零输出合成 response.failed（让客户端报错而非静默重试），
+	// 有输出则仍合成 response.incomplete。
+	contentSeen := false
 	var responseSnapshot map[string]interface{}
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
@@ -113,6 +117,9 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			if doc := parseResponsesStreamEventDoc(data); doc != nil {
 				if t, _ := doc["type"].(string); isResponsesTerminalEventType(t) {
 					terminalSeen = true
+				}
+				if t, _ := doc["type"].(string); t != "" && t != "response.created" && t != "response.in_progress" {
+					contentSeen = true
 				}
 				if responseSnapshot == nil {
 					if r, ok := doc["response"].(map[string]interface{}); ok {
@@ -137,6 +144,9 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		sendResponsesStreamData(c, streamResponse, sendData)
 		if isResponsesTerminalEventType(streamResponse.Type) {
 			terminalSeen = true
+		}
+		if streamResponse.Type != "" && streamResponse.Type != "response.created" && streamResponse.Type != "response.in_progress" {
+			contentSeen = true
 		}
 		if responseSnapshot == nil {
 			if doc := parseResponsesStreamEventDoc(data); doc != nil {
@@ -234,14 +244,25 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 
 	// 上游流结束但未发任何终止事件（半死连接、上游崩溃、超时）：给客户端
-	// 合成 response.incomplete，让严格客户端（如 Codex）干净地失败并重试，
-	// 而不是无限等待。客户端已断开（client_gone）时跳过——写了也收不到。
+	// 合成终止事件，让严格客户端（如 Codex）干净地失败，而不是无限等待。
+	// 零实质输出（连一个 delta 都没有）时合成 response.failed——这种情况
+	// 多半是上游转换层根本没产出内容，incomplete 会让客户端无谓重试；
+	// 已有部分输出时仍合成 response.incomplete 让客户端重试续传。
+	// 客户端已断开（client_gone）时跳过——写了也收不到。
 	if !terminalSeen && info.StreamStatus != nil &&
 		info.StreamStatus.EndReason != relaycommon.StreamEndReasonClientGone {
-		logger.LogWarn(c, fmt.Sprintf("responses stream ended without terminal event (reason=%s, received=%d), synthesizing response.incomplete",
-			info.StreamStatus.EndReason, info.ReceivedResponseCount))
-		if eventData := buildResponsesIncompleteEvent(responseSnapshot, info.StreamStatus.EndReason); eventData != "" {
-			_ = helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: "response.incomplete"}, eventData)
+		if contentSeen {
+			logger.LogWarn(c, fmt.Sprintf("responses stream ended without terminal event (reason=%s, received=%d), synthesizing response.incomplete",
+				info.StreamStatus.EndReason, info.ReceivedResponseCount))
+			if eventData := buildResponsesIncompleteEvent(responseSnapshot, info.StreamStatus.EndReason); eventData != "" {
+				_ = helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: "response.incomplete"}, eventData)
+			}
+		} else {
+			logger.LogWarn(c, fmt.Sprintf("responses stream ended without terminal event and zero content (reason=%s, received=%d), synthesizing response.failed",
+				info.StreamStatus.EndReason, info.ReceivedResponseCount))
+			if eventData := buildResponsesFailedEvent(responseSnapshot, info.StreamStatus.EndReason); eventData != "" {
+				_ = helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: "response.failed"}, eventData)
+			}
 		}
 	}
 
@@ -307,6 +328,53 @@ func buildResponsesIncompleteEvent(snapshot map[string]interface{}, endReason re
 	patchResponsesUsageDoc(resp)
 	doc := map[string]interface{}{
 		"type":     "response.incomplete",
+		"response": resp,
+	}
+	patched, err := common.Marshal(doc)
+	if err != nil {
+		return ""
+	}
+	return string(patched)
+}
+
+// buildResponsesFailedEvent builds a synthetic response.failed event for
+// streams that ended without any terminal event AND without any content
+// (the upstream produced nothing at all). Shape mirrors
+// buildResponsesIncompleteEvent but carries an error object instead of
+// incomplete_details. Returns "" when serialization fails.
+func buildResponsesFailedEvent(snapshot map[string]interface{}, endReason relaycommon.StreamEndReason) string {
+	resp := make(map[string]interface{}, len(snapshot)+6)
+	for k, v := range snapshot {
+		resp[k] = v
+	}
+	if _, ok := resp["id"]; !ok || resp["id"] == "" {
+		resp["id"] = "resp_" + common.GetRandomString(24)
+	}
+	resp["object"] = "response"
+	if _, ok := resp["created_at"]; !ok {
+		resp["created_at"] = time.Now().Unix()
+	}
+	resp["status"] = "failed"
+	code := "stream_truncated"
+	if endReason == relaycommon.StreamEndReasonTimeout {
+		code = "upstream_timeout"
+	}
+	resp["error"] = map[string]interface{}{
+		"code":    code,
+		"message": fmt.Sprintf("upstream stream ended with no content (reason=%s)", endReason),
+	}
+	if _, ok := resp["usage"]; !ok {
+		resp["usage"] = map[string]interface{}{
+			"input_tokens":          0,
+			"input_tokens_details":  map[string]interface{}{"cached_tokens": 0},
+			"output_tokens":         0,
+			"output_tokens_details": map[string]interface{}{"reasoning_tokens": 0},
+			"total_tokens":          0,
+		}
+	}
+	patchResponsesUsageDoc(resp)
+	doc := map[string]interface{}{
+		"type":     "response.failed",
 		"response": resp,
 	}
 	patched, err := common.Marshal(doc)

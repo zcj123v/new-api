@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/codexhistory"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -204,7 +205,7 @@ func TestChatCompletionsResponseToResponsesMapsCustomToolCall(t *testing.T) {
 		},
 	}
 
-	resp, _, err := ChatCompletionsResponseToResponsesResponseWithCustomTools(chat, "resp_1", map[string]bool{"apply_patch": true})
+	resp, _, err := ChatCompletionsResponseToResponsesResponseWithCustomTools(chat, "resp_1", map[string]bool{"apply_patch": true}, false)
 	require.NoError(t, err)
 	require.Len(t, resp.Output, 1)
 	assert.Equal(t, responsesOutputTypeCustomToolCall, resp.Output[0].Type)
@@ -214,7 +215,7 @@ func TestChatCompletionsResponseToResponsesMapsCustomToolCall(t *testing.T) {
 	assert.Empty(t, resp.Output[0].Arguments)
 
 	// 不在 customTools 里的同名调用保持 function_call（nil map 也安全）
-	resp2, _, err := ChatCompletionsResponseToResponsesResponseWithCustomTools(chat, "resp_1", nil)
+	resp2, _, err := ChatCompletionsResponseToResponsesResponseWithCustomTools(chat, "resp_1", nil, false)
 	require.NoError(t, err)
 	require.Len(t, resp2.Output, 1)
 	assert.Equal(t, responsesOutputTypeFunctionCall, resp2.Output[0].Type)
@@ -288,4 +289,118 @@ func TestChatCompletionsStreamToResponsesEventsCustomToolCall(t *testing.T) {
 	require.Len(t, completed.Payload.Response.Output, 1)
 	assert.Equal(t, responsesOutputTypeCustomToolCall, completed.Payload.Response.Output[0].Type)
 	assert.Equal(t, "*** Begin Patch", completed.Payload.Response.Output[0].Input)
+}
+
+// 流式方向：tool_search 还原为 tool_search_call（execution: client），
+// 不发 function_call_arguments.* 增量，arguments 在 output_item.done 一次性携带。
+func TestChatCompletionsStreamToResponsesEventsToolSearchCall(t *testing.T) {
+	state := NewChatToResponsesStreamState("resp_1", "gpt-test")
+	state.ToolSearchEnabled = true
+	toolIndex := 0
+
+	var events []ChatToResponsesStreamEvent
+	events = append(events, mustResponsesEventsFromChatChunk(t, state, &dto.ChatCompletionsStreamResponse{
+		Choices: []dto.ChatCompletionsStreamResponseChoice{
+			{Index: 0, Delta: dto.ChatCompletionsStreamResponseChoiceDelta{ToolCalls: []dto.ToolCallResponse{
+				{Index: &toolIndex, ID: "ts_1", Type: "function", Function: dto.FunctionResponse{Name: "tool_search"}},
+			}}},
+		},
+	})...)
+	events = append(events, mustResponsesEventsFromChatChunk(t, state, &dto.ChatCompletionsStreamResponse{
+		Choices: []dto.ChatCompletionsStreamResponseChoice{
+			{Index: 0, Delta: dto.ChatCompletionsStreamResponseChoiceDelta{ToolCalls: []dto.ToolCallResponse{
+				{Index: &toolIndex, Function: dto.FunctionResponse{Arguments: `{"query":"github","limit":3}`}},
+			}}},
+		},
+	})...)
+	finishReason := "tool_calls"
+	events = append(events, mustResponsesEventsFromChatChunk(t, state, &dto.ChatCompletionsStreamResponse{
+		Choices: []dto.ChatCompletionsStreamResponseChoice{
+			{Index: 0, FinishReason: &finishReason},
+		},
+	})...)
+	events = append(events, FinalizeChatCompletionsStreamToResponses(state)...)
+
+	for _, e := range events {
+		assert.NotEqual(t, responsesEventFunctionArgsDelta, e.Type, "tool_search must not emit function args deltas")
+		assert.NotEqual(t, responsesEventFunctionArgsDone, e.Type, "tool_search must not emit function args done")
+	}
+
+	var added, itemDone, completed *ChatToResponsesStreamEvent
+	for i := range events {
+		switch events[i].Type {
+		case responsesEventOutputItemAdded:
+			added = &events[i]
+		case responsesEventOutputItemDone:
+			itemDone = &events[i]
+		case responsesEventCompleted:
+			completed = &events[i]
+		}
+	}
+	require.NotNil(t, added)
+	assert.Equal(t, responsesOutputTypeToolSearchCall, added.Payload.Item.Type)
+	assert.Equal(t, "client", added.Payload.Item.Execution)
+	require.NotNil(t, itemDone)
+	assert.Equal(t, responsesOutputTypeToolSearchCall, itemDone.Payload.Item.Type)
+	assert.Equal(t, "client", itemDone.Payload.Item.Execution)
+	assert.JSONEq(t, `{"query":"github","limit":3}`, string(itemDone.Payload.Item.Arguments))
+	require.NotNil(t, completed)
+	require.Len(t, completed.Payload.Response.Output, 1)
+	assert.Equal(t, responsesOutputTypeToolSearchCall, completed.Payload.Response.Output[0].Type)
+}
+
+// 上游给出 tool_calls 但所有调用名为空：finalize 转 response.failed。
+func TestChatCompletionsStreamToResponsesDroppedToolCallsFail(t *testing.T) {
+	state := NewChatToResponsesStreamState("resp_1", "gpt-test")
+	toolIndex := 0
+
+	mustResponsesEventsFromChatChunk(t, state, &dto.ChatCompletionsStreamResponse{
+		Choices: []dto.ChatCompletionsStreamResponseChoice{
+			{Index: 0, Delta: dto.ChatCompletionsStreamResponseChoiceDelta{ToolCalls: []dto.ToolCallResponse{
+				{Index: &toolIndex, ID: "call_1", Type: "function", Function: dto.FunctionResponse{Name: ""}},
+			}}},
+		},
+	})
+	finishReason := "tool_calls"
+	mustResponsesEventsFromChatChunk(t, state, &dto.ChatCompletionsStreamResponse{
+		Choices: []dto.ChatCompletionsStreamResponseChoice{
+			{Index: 0, FinishReason: &finishReason},
+		},
+	})
+	events := FinalizeChatCompletionsStreamToResponses(state)
+
+	require.Len(t, events, 1)
+	assert.Equal(t, responsesEventFailed, events[0].Type)
+	require.NotNil(t, events[0].Payload.Response)
+	assert.JSONEq(t, `"failed"`, string(events[0].Payload.Response.Status))
+	errMap, ok := events[0].Payload.Response.Error.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "upstream_tool_call_dropped", errMap["code"])
+}
+
+// 工具调用历史记录：completed 响应的 function_call 进入 codexhistory 缓存。
+func TestChatCompletionsStreamRecordsToolCallHistory(t *testing.T) {
+	state := NewChatToResponsesStreamState("resp_hist_1", "gpt-test")
+	toolIndex := 0
+
+	mustResponsesEventsFromChatChunk(t, state, &dto.ChatCompletionsStreamResponse{
+		Choices: []dto.ChatCompletionsStreamResponseChoice{
+			{Index: 0, Delta: dto.ChatCompletionsStreamResponseChoiceDelta{ToolCalls: []dto.ToolCallResponse{
+				{Index: &toolIndex, ID: "call_h1", Type: "function", Function: dto.FunctionResponse{Name: "exec", Arguments: `{"cmd":"ls"}`}},
+			}}},
+		},
+	})
+	finishReason := "tool_calls"
+	mustResponsesEventsFromChatChunk(t, state, &dto.ChatCompletionsStreamResponse{
+		Choices: []dto.ChatCompletionsStreamResponseChoice{
+			{Index: 0, FinishReason: &finishReason},
+		},
+	})
+	FinalizeChatCompletionsStreamToResponses(state)
+
+	got := codexhistory.Lookup("resp_hist_1", map[string]bool{"call_h1": true})
+	require.Len(t, got, 1)
+	assert.Equal(t, "call_h1", got[0].CallID)
+	assert.Equal(t, "function_call", got[0].Item["type"])
+	assert.Equal(t, "exec", got[0].Item["name"])
 }

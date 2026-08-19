@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/codexhistory"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
@@ -48,7 +49,9 @@ func TestResponsesRequestToChatCompletionsRequestInstructionsAndScalarInput(t *t
 	assert.Equal(t, maxOutputTokens, lo.FromPtr(got.MaxCompletionTokens))
 	assert.Equal(t, 0.0, lo.FromPtr(got.Temperature))
 	assert.Equal(t, 0.9, lo.FromPtr(got.TopP))
-	assert.True(t, lo.FromPtr(got.ParallelTooCalls))
+	// 无 tools 时 tool_choice/parallel_tool_calls 会被摘除（严格上游拒绝
+	// 空 tools 带这两个字段的请求）。
+	assert.Nil(t, got.ParallelTooCalls)
 	assert.Equal(t, "cache-key", got.PromptCacheKey)
 	assert.Equal(t, "medium", got.ReasoningEffort)
 	assert.Equal(t, `"user-1"`, string(got.User))
@@ -319,11 +322,6 @@ func TestResponsesRequestToChatCompletionsRequestRejectsStatefulFields(t *testin
 			want: "conversation",
 		},
 		{
-			name: "previous response",
-			req:  &dto.OpenAIResponsesRequest{Model: "gpt-test", PreviousResponseID: "resp_1"},
-			want: "previous_response_id",
-		},
-		{
 			name: "prompt",
 			req:  &dto.OpenAIResponsesRequest{Model: "gpt-test", Prompt: mustRawMessage(t, map[string]any{"id": "pmpt_1"})},
 			want: "prompt",
@@ -476,10 +474,11 @@ func TestResponsesRequestToChatCompletionsRequestNamespaceAndAdditionalTools(t *
 	assert.ElementsMatch(t, []string{"nested_custom", "exec_custom"}, collected)
 }
 
-// tool_search / web_search 等 Responses 专属类型在 chat 上游无等价物，
-// 必须丢弃而不是透传（否则上游 400 unknown tool type）。
+// web_search / image_generation 等 Responses 专属类型在 chat 上游无等价物，
+// 必须丢弃而不是透传（否则上游 400 unknown tool type）；tool_search 例外，
+// 合成为同名 function（参考 CC Switch），响应侧再还原为 tool_search_call。
 func TestResponsesRequestToChatCompletionsRequestDropsUnsupportedToolTypes(t *testing.T) {
-	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+	req := &dto.OpenAIResponsesRequest{
 		Model: "gpt-test",
 		Input: mustRawMessage(t, "hi"),
 		Tools: mustRawMessage(t, []map[string]any{
@@ -488,9 +487,139 @@ func TestResponsesRequestToChatCompletionsRequestDropsUnsupportedToolTypes(t *te
 			{"type": "image_generation"},
 			{"type": "function", "name": "exec", "parameters": map[string]any{"type": "object"}},
 		}),
+	}
+	got, err := ResponsesRequestToChatCompletionsRequest(req)
+	require.NoError(t, err)
+	require.Len(t, got.Tools, 2)
+
+	toolSearch := got.Tools[0]
+	assert.Equal(t, "function", toolSearch.Type)
+	assert.Equal(t, "tool_search", toolSearch.Function.Name)
+	assert.Contains(t, toolSearch.Function.Description, "Search and load Codex tools")
+	params, ok := toolSearch.Function.Parameters.(map[string]any)
+	require.True(t, ok)
+	assert.Contains(t, params["required"], "query")
+
+	assert.Equal(t, "exec", got.Tools[1].Function.Name)
+	assert.True(t, ResponsesRequestHasToolSearch(req))
+}
+
+// previous_response_id 续轮：Codex 只带 function_call_output 而省略对应
+// function_call，必须用历史缓存把 call 项补回到 output 之前（参考 CC Switch）。
+func TestResponsesRequestToChatCompletionsRequestRestoresCallsFromHistory(t *testing.T) {
+	codexhistory.Record("resp_prev", []codexhistory.CachedCall{
+		{CallID: "call_9", Item: map[string]any{
+			"type":      "function_call",
+			"call_id":   "call_9",
+			"name":      "exec",
+			"arguments": `{"cmd":"ls"}`,
+		}},
+	})
+
+	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+		Model:              "gpt-test",
+		PreviousResponseID: "resp_prev",
+		Input: mustRawMessage(t, []map[string]any{
+			{
+				"type":    "function_call_output",
+				"call_id": "call_9",
+				"output":  "done",
+			},
+		}),
 	})
 	require.NoError(t, err)
-	require.Len(t, got.Tools, 1)
-	assert.Equal(t, "function", got.Tools[0].Type)
-	assert.Equal(t, "exec", got.Tools[0].Function.Name)
+
+	require.Len(t, got.Messages, 2)
+	assert.Equal(t, "assistant", got.Messages[0].Role)
+	toolCalls := got.Messages[0].ParseToolCalls()
+	require.Len(t, toolCalls, 1)
+	assert.Equal(t, "call_9", toolCalls[0].ID)
+	assert.Equal(t, "exec", toolCalls[0].Function.Name)
+	assert.JSONEq(t, `{"cmd":"ls"}`, toolCalls[0].Function.Arguments)
+	assert.Equal(t, "tool", got.Messages[1].Role)
+	assert.Equal(t, "call_9", got.Messages[1].ToolCallId)
+}
+
+// call 项已存在时不重复补回。
+func TestResponsesRequestToChatCompletionsRequestHistoryNoDoubleRestore(t *testing.T) {
+	codexhistory.Record("resp_prev2", []codexhistory.CachedCall{
+		{CallID: "call_8", Item: map[string]any{
+			"type":      "function_call",
+			"call_id":   "call_8",
+			"name":      "exec",
+			"arguments": `{}`,
+		}},
+	})
+
+	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+		Model:              "gpt-test",
+		PreviousResponseID: "resp_prev2",
+		Input: mustRawMessage(t, []map[string]any{
+			{
+				"type":      "function_call",
+				"call_id":   "call_8",
+				"name":      "exec",
+				"arguments": `{}`,
+			},
+			{
+				"type":    "function_call_output",
+				"call_id": "call_8",
+				"output":  "ok",
+			},
+		}),
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Messages, 2)
+	require.Len(t, got.Messages[0].ParseToolCalls(), 1)
+}
+
+// assistant 的 tool_calls 缺 reasoning_content 时补占位（部分严格上游要求）。
+func TestResponsesRequestToChatCompletionsRequestBackfillsReasoningPlaceholder(t *testing.T) {
+	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+		Model: "gpt-test",
+		Input: mustRawMessage(t, []map[string]any{
+			{
+				"type":      "function_call",
+				"call_id":   "call_1",
+				"name":      "lookup",
+				"arguments": `{"q":"x"}`,
+			},
+		}),
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Messages, 1)
+	require.NotNil(t, got.Messages[0].ReasoningContent)
+	assert.Equal(t, "tool call", *got.Messages[0].ReasoningContent)
+}
+
+// tool_search_call / tool_search_output 输入项映射为 function(tool_search)
+// 调用与 tool 消息。
+func TestResponsesRequestToChatCompletionsRequestToolSearchInputItems(t *testing.T) {
+	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+		Model: "gpt-test",
+		Input: mustRawMessage(t, []map[string]any{
+			{
+				"type":      "tool_search_call",
+				"call_id":   "ts_1",
+				"status":    "completed",
+				"execution": "client",
+				"arguments": map[string]any{"query": "github"},
+			},
+			{
+				"type":    "tool_search_output",
+				"call_id": "ts_1",
+				"tools":   []map[string]any{{"type": "function", "name": "github_search"}},
+			},
+		}),
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Messages, 2)
+	assert.Equal(t, "assistant", got.Messages[0].Role)
+	toolCalls := got.Messages[0].ParseToolCalls()
+	require.Len(t, toolCalls, 1)
+	assert.Equal(t, "ts_1", toolCalls[0].ID)
+	assert.Equal(t, "tool_search", toolCalls[0].Function.Name)
+	assert.JSONEq(t, `{"query":"github"}`, toolCalls[0].Function.Arguments)
+	assert.Equal(t, "tool", got.Messages[1].Role)
+	assert.Equal(t, "ts_1", got.Messages[1].ToolCallId)
 }

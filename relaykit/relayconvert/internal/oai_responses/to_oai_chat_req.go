@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/codexhistory"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 )
 
@@ -15,7 +16,13 @@ const (
 	responsesInputTypeFunctionCallOutput = "function_call_output"
 	responsesInputTypeCustomToolCall     = "custom_tool_call"
 	responsesInputTypeCustomToolOutput   = "custom_tool_call_output"
+	responsesInputTypeToolSearchCall     = "tool_search_call"
+	responsesInputTypeToolSearchOutput   = "tool_search_output"
 )
+
+// toolSearchProxyName 是 tool_search 在 chat 侧合成的 function 名
+//（对齐 CC Switch 的 TOOL_SEARCH_PROXY_NAME）。
+const toolSearchProxyName = "tool_search"
 
 const (
 	ResponsesInputTypeFunctionCall       = responsesInputTypeFunctionCall
@@ -35,18 +42,30 @@ func ResponsesRequestToChatCompletionsRequest(req *dto.OpenAIResponsesRequest) (
 		return nil, err
 	}
 
-	messages, err := responsesRequestMessagesToChat(req)
+	// previous_response_id 续轮：Codex 可能只带新的 *_output 项而省略对应的
+	// call 项，先用历史缓存补回（参考 CC Switch 的历史恢复）。
+	workReq := req
+	if strings.TrimSpace(req.PreviousResponseID) != "" {
+		if restored := restoreCallsFromHistory(strings.TrimSpace(req.PreviousResponseID), req.Input); restored != nil {
+			copied := *req
+			copied.Input = restored
+			workReq = &copied
+		}
+	}
+
+	messages, err := responsesRequestMessagesToChat(workReq)
 	if err != nil {
 		return nil, err
 	}
 
-	tools, err := responsesRequestToolsToChat(req.Tools)
+	tools, err := responsesRequestToolsToChat(workReq.Tools)
 	if err != nil {
 		return nil, err
 	}
 	// Codex 会把 exec/collaboration 等工具放在 input 的 additional_tools 项里，
-	// 而不是顶层 tools。提取出来一并转换，消息流里跳过该项。
-	if extraRaw := responsesInputAdditionalToolsRaw(req.Input); len(extraRaw) > 0 {
+	// tool_search_output 项（客户端工具搜索的结果）里也有工具定义，
+	// 而不是顶层 tools。提取出来一并转换，消息流里跳过这些项。
+	if extraRaw := responsesInputEmbeddedToolsRaw(workReq.Input); len(extraRaw) > 0 {
 		extraTools, err := responsesRequestToolsToChat(extraRaw)
 		if err != nil {
 			return nil, err
@@ -113,16 +132,48 @@ func ResponsesRequestToChatCompletionsRequest(req *dto.OpenAIResponsesRequest) (
 		}
 	}
 
+	// kimi/Moonshot、DeepSeek 等 thinking 模型要求带 tool_calls 的 assistant
+	// 消息必须携带非空 reasoning_content，缺失会 400。管线末端统一补占位
+	// （参考 CC Switch ensure_tool_call_reasoning_content）。
+	backfillToolCallReasoningPlaceholders(out.Messages)
+
+	// 严格上游拒绝 tools 为空但带 tool_choice/parallel_tool_calls 的请求。
+	if len(out.Tools) == 0 {
+		out.ToolChoice = nil
+		out.ParallelTooCalls = nil
+	}
+	// OpenAI 兼容上游流式默认不吐 usage chunk，必须显式 include_usage，
+	// 否则 kimi/MiniMax 等流式请求 token 全部漏记。
+	if out.Stream != nil && *out.Stream && out.StreamOptions == nil {
+		out.StreamOptions = &dto.StreamOptions{IncludeUsage: true}
+	}
+
 	return out, nil
+}
+
+// backfillToolCallReasoningPlaceholders 给仍缺 reasoning_content 的
+// assistant tool-call 消息补占位字符串。
+func backfillToolCallReasoningPlaceholders(messages []dto.Message) {
+	for i := range messages {
+		msg := &messages[i]
+		if msg.Role != "assistant" {
+			continue
+		}
+		if len(msg.ParseToolCalls()) == 0 {
+			continue
+		}
+		if msg.ReasoningContent != nil && strings.TrimSpace(*msg.ReasoningContent) != "" {
+			continue
+		}
+		placeholder := "tool call"
+		msg.ReasoningContent = &placeholder
+	}
 }
 
 func validateResponsesRequestChatUnsupportedFields(req *dto.OpenAIResponsesRequest) error {
 	unsupported := make([]string, 0, 4)
 	if rawJSONPresent(req.Conversation) {
 		unsupported = append(unsupported, "conversation")
-	}
-	if strings.TrimSpace(req.PreviousResponseID) != "" {
-		unsupported = append(unsupported, "previous_response_id")
 	}
 	if rawJSONPresent(req.Prompt) {
 		unsupported = append(unsupported, "prompt")
@@ -197,7 +248,13 @@ func responsesInputItemToChatMessages(item map[string]any, messages []dto.Messag
 			return nil, err
 		}
 		return appendToolCallToLastAssistant(messages, toolCall), nil
-	case responsesInputTypeFunctionCallOutput, responsesInputTypeCustomToolOutput:
+	case responsesInputTypeToolSearchCall:
+		toolCall, err := responsesToolSearchCallItemToChatToolCall(item)
+		if err != nil {
+			return nil, err
+		}
+		return appendToolCallToLastAssistant(messages, toolCall), nil
+	case responsesInputTypeFunctionCallOutput, responsesInputTypeCustomToolOutput, responsesInputTypeToolSearchOutput:
 		callID := strings.TrimSpace(kitutil.Interface2String(item["call_id"]))
 		content := responseToolOutputToChatContent(item["output"])
 		return append(messages, dto.Message{Role: "tool", ToolCallId: callID, Content: content}), nil
@@ -205,8 +262,13 @@ func responsesInputItemToChatMessages(item map[string]any, messages []dto.Messag
 
 	role := strings.TrimSpace(kitutil.Interface2String(item["role"]))
 	if itemType == "additional_tools" {
-		// 工具清单项，不是消息：其中的 tools 已在
+		// 工具清单/工具搜索结果项，不是消息：其中的 tools 已在
 		// ResponsesRequestToChatCompletionsRequest 里单独提取转换。
+		return messages, nil
+	}
+	if itemType == "reasoning" {
+		// reasoning 项对 chat 上游无意义（encrypted_content 无法解密），
+		// 直接跳过，避免退化成空 user 消息。
 		return messages, nil
 	}
 	if role == "" {
@@ -313,8 +375,31 @@ func responsesFunctionCallItemToChatToolCall(item map[string]any) (dto.ToolCallR
 	}, nil
 }
 
-func responsesCustomToolCallItemToChatToolCall(item map[string]any) (dto.ToolCallRequest, error) {
-	name := strings.TrimSpace(kitutil.Interface2String(item["name"]))
+func responsesToolSearchCallItemToChatToolCall(item map[string]any) (dto.ToolCallRequest, error) {
+	// tool_search_call → tool_search function 调用；arguments 规范化为 JSON 字符串。
+	arguments := "{}"
+	switch v := item["arguments"].(type) {
+	case string:
+		if strings.TrimSpace(v) != "" {
+			arguments = v
+		}
+	case nil:
+	default:
+		if raw, err := kitutil.Marshal(v); err == nil {
+			arguments = string(raw)
+		}
+	}
+	return dto.ToolCallRequest{
+		ID:   responsesCallID(item),
+		Type: "function",
+		Function: dto.FunctionRequest{
+			Name:      toolSearchProxyName,
+			Arguments: arguments,
+		},
+	}, nil
+}
+
+func responsesCustomToolCallItemToChatToolCall(item map[string]any) (dto.ToolCallRequest, error) {	name := strings.TrimSpace(kitutil.Interface2String(item["name"]))
 	if name == "" {
 		return dto.ToolCallRequest{}, errors.New("custom_tool_call item is missing name")
 	}
@@ -368,6 +453,34 @@ func responsesRequestToolsToChat(raw json.RawMessage) ([]dto.ToolCallRequest, er
 			continue
 		}
 
+		if toolType == "tool_search" {
+			// tool_search 由 Codex 客户端本地执行，但上游模型需要"看到"它
+			// 才会发起调用。合成同名 function（对齐 CC Switch），响应方向再
+			// 还原为 tool_search_call（execution: client）。
+			out = append(out, dto.ToolCallRequest{
+				Type: "function",
+				Function: dto.FunctionRequest{
+					Name:        toolSearchProxyName,
+					Description: "Search and load Codex tools, plugins, connectors, and MCP namespaces for the current task.",
+					Parameters: map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"query": map[string]any{
+								"type":        "string",
+								"description": "Search query for tools or connectors to load.",
+							},
+							"limit": map[string]any{
+								"type":        "integer",
+								"description": "Maximum number of tool groups to return.",
+							},
+						},
+						"required": []string{"query"},
+					},
+				},
+			})
+			continue
+		}
+
 		if toolType == dto.CustomType {
 			// freeform 工具（如 Codex 的 apply_patch）：chat 上游只认 function，
 			// 伪装成 {"input": "..."} 单参数函数；响应方向按工具名还原。
@@ -383,6 +496,11 @@ func responsesRequestToolsToChat(raw json.RawMessage) ([]dto.ToolCallRequest, er
 					}
 					description += "Input format: " + formatDesc
 				}
+			}
+			// 把原始工具定义嵌入描述，保住 freeform 工具的 format/grammar
+			// 约束，减少 apply_patch 类工具的格式漂移（参考 CC Switch）。
+			if rawDef, err := kitutil.Marshal(tool); err == nil {
+				description += "\n\nOriginal tool definition:\n```json\n" + string(rawDef) + "\n```"
 			}
 			out = append(out, dto.ToolCallRequest{
 				Type: "function",
@@ -468,6 +586,33 @@ func collectCustomToolNamesFromTools(tools []map[string]any) []string {
 	return names
 }
 
+// ResponsesRequestHasToolSearch reports whether the request declares a
+// tool_search tool (top-level tools or embedded in input items).
+func ResponsesRequestHasToolSearch(req *dto.OpenAIResponsesRequest) bool {
+	if req == nil {
+		return false
+	}
+	hasToolSearch := func(raw json.RawMessage) bool {
+		if !rawJSONPresent(raw) {
+			return false
+		}
+		var tools []map[string]any
+		if err := kitutil.Unmarshal(raw, &tools); err != nil {
+			return false
+		}
+		for _, tool := range tools {
+			if strings.TrimSpace(kitutil.Interface2String(tool["type"])) == "tool_search" {
+				return true
+			}
+		}
+		return false
+	}
+	if hasToolSearch(req.Tools) {
+		return true
+	}
+	return hasToolSearch(responsesInputEmbeddedToolsRaw(req.Input))
+}
+
 // CollectResponsesCustomToolNamesFromRequest collects custom tool names from
 // both the top-level tools and input additional_tools items.
 func CollectResponsesCustomToolNamesFromRequest(req *dto.OpenAIResponsesRequest) []string {
@@ -475,15 +620,17 @@ func CollectResponsesCustomToolNamesFromRequest(req *dto.OpenAIResponsesRequest)
 		return nil
 	}
 	names := CollectResponsesCustomToolNames(req.Tools)
-	if extraRaw := responsesInputAdditionalToolsRaw(req.Input); len(extraRaw) > 0 {
+	if extraRaw := responsesInputEmbeddedToolsRaw(req.Input); len(extraRaw) > 0 {
 		names = append(names, CollectResponsesCustomToolNames(extraRaw)...)
 	}
 	return names
 }
 
-// responsesInputAdditionalToolsRaw extracts the tools arrays of
-// additional_tools input items (Codex sends exec/collaboration etc. there).
-func responsesInputAdditionalToolsRaw(input json.RawMessage) json.RawMessage {
+// responsesInputEmbeddedToolsRaw extracts tool definitions embedded in input
+// items: additional_tools items (Codex sends exec/collaboration etc. there)
+// and tool_search_output items (client-side tool search results carry the
+// discovered tool definitions).
+func responsesInputEmbeddedToolsRaw(input json.RawMessage) json.RawMessage {
 	if kitutil.GetJsonType(input) != "array" {
 		return nil
 	}
@@ -493,7 +640,8 @@ func responsesInputAdditionalToolsRaw(input json.RawMessage) json.RawMessage {
 	}
 	out := make([]any, 0)
 	for _, item := range items {
-		if strings.TrimSpace(kitutil.Interface2String(item["type"])) != "additional_tools" {
+		itemType := strings.TrimSpace(kitutil.Interface2String(item["type"]))
+		if itemType != "additional_tools" && itemType != "tool_search_output" {
 			continue
 		}
 		var tools []any
@@ -513,6 +661,84 @@ func responsesInputAdditionalToolsRaw(input json.RawMessage) json.RawMessage {
 	if err != nil {
 		return nil
 	}
+	return raw
+}
+
+// restoreCallsFromHistory 用历史缓存补回 previous_response_id 续轮中缺失的
+// 工具调用项：input 里出现了 *_output 但对应 call 项缺失时，在该 output 之前
+// 插入缓存的 call 项。返回 nil 表示无需修改。
+func restoreCallsFromHistory(previousResponseID string, input json.RawMessage) json.RawMessage {
+	if kitutil.GetJsonType(input) != "array" {
+		return nil
+	}
+	var items []map[string]any
+	if err := kitutil.Unmarshal(input, &items); err != nil {
+		return nil
+	}
+
+	existing := make(map[string]bool)
+	requested := make(map[string]bool)
+	for _, item := range items {
+		callID := strings.TrimSpace(kitutil.Interface2String(item["call_id"]))
+		if callID == "" {
+			callID = strings.TrimSpace(kitutil.Interface2String(item["id"]))
+		}
+		if callID == "" {
+			continue
+		}
+		switch strings.TrimSpace(kitutil.Interface2String(item["type"])) {
+		case responsesInputTypeFunctionCall, responsesInputTypeCustomToolCall, responsesInputTypeToolSearchCall:
+			existing[callID] = true
+			requested[callID] = true
+		case responsesInputTypeFunctionCallOutput, responsesInputTypeCustomToolOutput, responsesInputTypeToolSearchOutput:
+			requested[callID] = true
+		}
+	}
+	cached := codexhistory.Lookup(previousResponseID, requested)
+	if len(cached) == 0 {
+		return nil
+	}
+	byCallID := make(map[string]map[string]any, len(cached))
+	for _, call := range cached {
+		byCallID[call.CallID] = call.Item
+	}
+
+	seen := make(map[string]bool)
+	for id := range existing {
+		seen[id] = true
+	}
+	restored := false
+	out := make([]map[string]any, 0, len(items)+len(cached))
+	for _, item := range items {
+		itemType := strings.TrimSpace(kitutil.Interface2String(item["type"]))
+		callID := strings.TrimSpace(kitutil.Interface2String(item["call_id"]))
+		switch itemType {
+		case responsesInputTypeFunctionCall, responsesInputTypeCustomToolCall, responsesInputTypeToolSearchCall:
+			if callID == "" {
+				callID = strings.TrimSpace(kitutil.Interface2String(item["id"]))
+			}
+			if callID != "" {
+				seen[callID] = true
+			}
+		case responsesInputTypeFunctionCallOutput, responsesInputTypeCustomToolOutput, responsesInputTypeToolSearchOutput:
+			if callID != "" && !seen[callID] {
+				if cachedItem, ok := byCallID[callID]; ok {
+					out = append(out, cachedItem)
+					restored = true
+				}
+				seen[callID] = true
+			}
+		}
+		out = append(out, item)
+	}
+	if !restored {
+		return nil
+	}
+	raw, err := kitutil.Marshal(out)
+	if err != nil {
+		return nil
+	}
+	kitutil.LogInfo(fmt.Sprintf("responses->chat: restored %d tool call(s) from history for previous_response_id=%s", len(cached), previousResponseID))
 	return raw
 }
 

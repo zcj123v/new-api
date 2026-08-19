@@ -10,6 +10,7 @@ import (
 // custom_tool_call。上下文在运行时是 gin.Context（实现 Set/Get），用最小
 // 接口断言以避免 relaykit 依赖 gin。
 const responsesCustomToolNamesContextKey = "responses_custom_tool_names"
+const responsesToolSearchContextKey = "responses_tool_search_enabled"
 
 type contextKVSetter interface {
 	Set(string, any)
@@ -46,4 +47,26 @@ func responsesCustomToolNamesFromContext(c context.Context) map[string]bool {
 		set[name] = true
 	}
 	return set
+}
+
+func stashResponsesToolSearchEnabled(c context.Context, enabled bool) {
+	if !enabled {
+		return
+	}
+	if s, ok := c.(contextKVSetter); ok {
+		s.Set(responsesToolSearchContextKey, true)
+	}
+}
+
+func responsesToolSearchEnabledFromContext(c context.Context) bool {
+	g, ok := c.(contextKVGetter)
+	if !ok {
+		return false
+	}
+	v, ok := g.Get(responsesToolSearchContextKey)
+	if !ok {
+		return false
+	}
+	enabled, ok := v.(bool)
+	return ok && enabled
 }

@@ -84,8 +84,8 @@ func ChatCompletionsResponseToResponsesResponse(resp *dto.OpenAITextResponse, id
 	return oaichat.ChatCompletionsResponseToResponsesResponse(resp, id)
 }
 
-func ChatCompletionsResponseToResponsesResponseWithCustomTools(resp *dto.OpenAITextResponse, id string, customTools map[string]bool) (*dto.OpenAIResponsesResponse, *dto.Usage, error) {
-	return oaichat.ChatCompletionsResponseToResponsesResponseWithCustomTools(resp, id, customTools)
+func ChatCompletionsResponseToResponsesResponseWithCustomTools(resp *dto.OpenAITextResponse, id string, customTools map[string]bool, toolSearchEnabled bool) (*dto.OpenAIResponsesResponse, *dto.Usage, error) {
+	return oaichat.ChatCompletionsResponseToResponsesResponseWithCustomTools(resp, id, customTools, toolSearchEnabled)
 }
 
 func ResponsesStatusFromChatFinishReason(finishReason string) (string, *dto.IncompleteDetails) {

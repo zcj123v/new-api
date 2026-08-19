@@ -295,3 +295,49 @@ func TestOaiResponsesStreamHandlerNoSynthesisOnCompleted(t *testing.T) {
 	assert.NotContains(t, w.Body.String(), "response.incomplete",
 		"normal completed stream must not get a synthesized incomplete event")
 }
+
+// 上游只发了 response.created 就 EOF（零实质输出，多半是转换层根本没产出
+// 内容）：合成 response.failed 而不是 incomplete，让客户端直接报错而不是
+// 无谓重试。
+func TestOaiResponsesStreamHandlerSynthesizesFailedOnEmptyEOF(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() {
+		constant.StreamingTimeout = oldTimeout
+	})
+
+	body := "data: " + `{"type":"response.created","sequence_number":0,"response":{"id":"resp_eof0","object":"response","created_at":1786885892,"status":"in_progress","model":"gpt-5.1","output":[]}}` + "\n\n"
+	// 没有任何实质输出事件，也没有 [DONE]。
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Set(common.RequestIdKey, "responses-stream-empty-eof-test")
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "gpt-5.1",
+		DisablePing:     true,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: "gpt-5.1",
+		},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+
+	_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+
+	out := w.Body.String()
+	assert.Contains(t, out, "event: response.failed",
+		"must synthesize response.failed when upstream ends with zero content")
+	assert.NotContains(t, out, "event: response.incomplete",
+		"zero-content stream must not be reported as incomplete")
+	assert.Contains(t, out, `"id":"resp_eof0"`)
+	assert.Contains(t, out, `"status":"failed"`)
+	assert.Contains(t, out, `"code":"stream_truncated"`)
+	assert.True(t, strings.HasSuffix(strings.TrimSpace(out), "data: [DONE]"),
+		"stream must still end with [DONE]")
+}

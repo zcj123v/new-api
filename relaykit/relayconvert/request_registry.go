@@ -497,5 +497,6 @@ func convertResponsesRequestToChat(c context.Context, _ convmeta.Meta, request a
 	}
 	// 记录被伪装成 function 的 custom（freeform）工具名，供响应方向还原。
 	stashResponsesCustomToolNames(c, oairesponses.CollectResponsesCustomToolNamesFromRequest(responsesRequest))
+	stashResponsesToolSearchEnabled(c, oairesponses.ResponsesRequestHasToolSearch(responsesRequest))
 	return oairesponses.ResponsesRequestToChatCompletionsRequest(responsesRequest)
 }

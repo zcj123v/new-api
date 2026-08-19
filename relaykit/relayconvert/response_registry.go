@@ -801,7 +801,7 @@ func convertOAIChatResponseToOAIResponses(c context.Context, _ convmeta.Meta, re
 	if id == "" {
 		id = fmt.Sprintf("resp_%s", kitutil.GetUUID())
 	}
-	return ChatCompletionsResponseToResponsesResponseWithCustomTools(chatResponse, id, responsesCustomToolNamesFromContext(c))
+	return ChatCompletionsResponseToResponsesResponseWithCustomTools(chatResponse, id, responsesCustomToolNamesFromContext(c), responsesToolSearchEnabledFromContext(c))
 }
 
 func convertOAIResponsesResponseToOAIChat(_ context.Context, _ convmeta.Meta, response any) (any, *dto.Usage, error) {
@@ -840,6 +840,7 @@ func convertOAIChatStreamResponseToOAIResponses(c context.Context, _ convmeta.Me
 	if streamState.CustomTools == nil {
 		streamState.CustomTools = responsesCustomToolNamesFromContext(c)
 	}
+	streamState.ToolSearchEnabled = responsesToolSearchEnabledFromContext(c)
 	events, err := ChatCompletionsStreamChunkToResponsesEvents(chatResponse, streamState)
 	if err != nil {
 		return nil, nil, err
