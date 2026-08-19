@@ -44,6 +44,15 @@ func ResponsesRequestToChatCompletionsRequest(req *dto.OpenAIResponsesRequest) (
 	if err != nil {
 		return nil, err
 	}
+	// Codex 会把 exec/collaboration 等工具放在 input 的 additional_tools 项里，
+	// 而不是顶层 tools。提取出来一并转换，消息流里跳过该项。
+	if extraRaw := responsesInputAdditionalToolsRaw(req.Input); len(extraRaw) > 0 {
+		extraTools, err := responsesRequestToolsToChat(extraRaw)
+		if err != nil {
+			return nil, err
+		}
+		tools = append(tools, extraTools...)
+	}
 
 	toolChoice, err := responsesRequestToolChoiceToChat(req.ToolChoice)
 	if err != nil {
@@ -195,6 +204,11 @@ func responsesInputItemToChatMessages(item map[string]any, messages []dto.Messag
 	}
 
 	role := strings.TrimSpace(kitutil.Interface2String(item["role"]))
+	if itemType == "additional_tools" {
+		// 工具清单项，不是消息：其中的 tools 已在
+		// ResponsesRequestToChatCompletionsRequest 里单独提取转换。
+		return messages, nil
+	}
 	if role == "" {
 		role = "user"
 	}
@@ -390,6 +404,21 @@ func responsesRequestToolsToChat(raw json.RawMessage) ([]dto.ToolCallRequest, er
 			continue
 		}
 
+		if toolType == "namespace" {
+			// namespace 信封（Codex collaboration/MCP 等）：chat 上游不认识，
+			// 展平为内部嵌套的工具定义（内部 custom 递归伪装）。
+			nestedRaw, err := kitutil.Marshal(tool["tools"])
+			if err != nil {
+				return nil, err
+			}
+			nested, err := responsesRequestToolsToChat(nestedRaw)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, nested...)
+			continue
+		}
+
 		rawTool, err := kitutil.Marshal(tool)
 		if err != nil {
 			return nil, err
@@ -413,9 +442,25 @@ func CollectResponsesCustomToolNames(raw json.RawMessage) []string {
 	if err := kitutil.Unmarshal(raw, &tools); err != nil {
 		return nil
 	}
+	return collectCustomToolNamesFromTools(tools)
+}
+
+func collectCustomToolNamesFromTools(tools []map[string]any) []string {
 	names := make([]string, 0, len(tools))
 	for _, tool := range tools {
-		if strings.TrimSpace(kitutil.Interface2String(tool["type"])) != dto.CustomType {
+		toolType := strings.TrimSpace(kitutil.Interface2String(tool["type"]))
+		if toolType == "namespace" {
+			// 递归收集 namespace 信封内的 custom 工具
+			var nested []map[string]any
+			nestedRaw, err := kitutil.Marshal(tool["tools"])
+			if err == nil && rawJSONPresent(nestedRaw) {
+				if err := kitutil.Unmarshal(nestedRaw, &nested); err == nil {
+					names = append(names, collectCustomToolNamesFromTools(nested)...)
+				}
+			}
+			continue
+		}
+		if toolType != dto.CustomType {
 			continue
 		}
 		if name := strings.TrimSpace(kitutil.Interface2String(tool["name"])); name != "" {
@@ -423,6 +468,54 @@ func CollectResponsesCustomToolNames(raw json.RawMessage) []string {
 		}
 	}
 	return names
+}
+
+// CollectResponsesCustomToolNamesFromRequest collects custom tool names from
+// both the top-level tools and input additional_tools items.
+func CollectResponsesCustomToolNamesFromRequest(req *dto.OpenAIResponsesRequest) []string {
+	if req == nil {
+		return nil
+	}
+	names := CollectResponsesCustomToolNames(req.Tools)
+	if extraRaw := responsesInputAdditionalToolsRaw(req.Input); len(extraRaw) > 0 {
+		names = append(names, CollectResponsesCustomToolNames(extraRaw)...)
+	}
+	return names
+}
+
+// responsesInputAdditionalToolsRaw extracts the tools arrays of
+// additional_tools input items (Codex sends exec/collaboration etc. there).
+func responsesInputAdditionalToolsRaw(input json.RawMessage) json.RawMessage {
+	if kitutil.GetJsonType(input) != "array" {
+		return nil
+	}
+	var items []map[string]any
+	if err := kitutil.Unmarshal(input, &items); err != nil {
+		return nil
+	}
+	out := make([]any, 0)
+	for _, item := range items {
+		if strings.TrimSpace(kitutil.Interface2String(item["type"])) != "additional_tools" {
+			continue
+		}
+		var tools []any
+		toolsRaw, err := kitutil.Marshal(item["tools"])
+		if err != nil || !rawJSONPresent(toolsRaw) {
+			continue
+		}
+		if err := kitutil.Unmarshal(toolsRaw, &tools); err != nil {
+			continue
+		}
+		out = append(out, tools...)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	raw, err := kitutil.Marshal(out)
+	if err != nil {
+		return nil
+	}
+	return raw
 }
 
 func responsesRequestToolChoiceToChat(raw json.RawMessage) (any, error) {

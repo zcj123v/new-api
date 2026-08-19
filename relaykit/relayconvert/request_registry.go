@@ -496,6 +496,6 @@ func convertResponsesRequestToChat(c context.Context, _ convmeta.Meta, request a
 		return nil, fmt.Errorf("expected OpenAI responses request, got %T", request)
 	}
 	// 记录被伪装成 function 的 custom（freeform）工具名，供响应方向还原。
-	stashResponsesCustomToolNames(c, oairesponses.CollectResponsesCustomToolNames(responsesRequest.Tools))
+	stashResponsesCustomToolNames(c, oairesponses.CollectResponsesCustomToolNamesFromRequest(responsesRequest))
 	return oairesponses.ResponsesRequestToChatCompletionsRequest(responsesRequest)
 }

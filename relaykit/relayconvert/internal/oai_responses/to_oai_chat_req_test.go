@@ -406,3 +406,72 @@ func mustRawMessage(t *testing.T, value any) []byte {
 	require.NoError(t, err)
 	return raw
 }
+
+// Codex 的 namespace 工具信封（collaboration/MCP 等）必须展平成内部工具；
+// input 里的 additional_tools 项要提取为工具且不产生消息。
+func TestResponsesRequestToChatCompletionsRequestNamespaceAndAdditionalTools(t *testing.T) {
+	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+		Model: "gpt-test",
+		Input: mustRawMessage(t, []map[string]any{
+			{"role": "user", "content": "hi"},
+			{
+				"type": "additional_tools",
+				"role": "developer",
+				"tools": []map[string]any{
+					{"type": "function", "name": "exec", "description": "run cmd", "parameters": map[string]any{"type": "object"}},
+					{
+						"type":        "namespace",
+						"name":        "collaboration",
+						"description": "sub-agents",
+						"tools": []map[string]any{
+							{"type": "function", "name": "spawn_agent", "parameters": map[string]any{"type": "object"}},
+							{"type": "custom", "name": "wait_agent"},
+						},
+					},
+				},
+			},
+		}),
+		Tools: mustRawMessage(t, []map[string]any{
+			{
+				"type": "namespace",
+				"name": "mcp",
+				"tools": []map[string]any{
+					{"type": "function", "name": "search", "parameters": map[string]any{"type": "object"}},
+				},
+			},
+		}),
+	})
+	require.NoError(t, err)
+
+	// additional_tools 不产生消息
+	require.Len(t, got.Messages, 1)
+	assert.Equal(t, "user", got.Messages[0].Role)
+
+	// namespace 展平 + additional_tools 提取：search / exec / spawn_agent / wait_agent
+	names := make([]string, 0, len(got.Tools))
+	for _, tool := range got.Tools {
+		assert.Equal(t, "function", tool.Type, "no non-function tool type may leak to chat upstreams")
+		names = append(names, tool.Function.Name)
+	}
+	assert.ElementsMatch(t, []string{"search", "exec", "spawn_agent", "wait_agent"}, names)
+
+	// namespace 内的 custom 也被伪装
+	for _, tool := range got.Tools {
+		if tool.Function.Name == "wait_agent" {
+			params, ok := tool.Function.Parameters.(map[string]any)
+			require.True(t, ok)
+			assert.Contains(t, params["required"], "input")
+		}
+	}
+
+	// 名字收集覆盖顶层 + namespace + additional_tools
+	collected := CollectResponsesCustomToolNamesFromRequest(&dto.OpenAIResponsesRequest{
+		Tools: mustRawMessage(t, []map[string]any{
+			{"type": "namespace", "name": "mcp", "tools": []map[string]any{{"type": "custom", "name": "nested_custom"}}},
+		}),
+		Input: mustRawMessage(t, []map[string]any{
+			{"type": "additional_tools", "tools": []map[string]any{{"type": "custom", "name": "exec_custom"}}},
+		}),
+	})
+	assert.ElementsMatch(t, []string{"nested_custom", "exec_custom"}, collected)
+}
