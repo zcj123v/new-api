@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
@@ -94,6 +95,13 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	imageCounter := &relaycommon.ImageGenerationCallCounter{}
 	imageCommitted := false
 
+	// 终止事件跟踪：上游流可能在没有 response.completed/failed/incomplete
+	// 的情况下直接 EOF（半死连接、上游崩溃等）。严格客户端（如 Codex）会
+	// 一直等待终止事件而表现为"卡死"。流结束时若未见到终止事件，兜底合成
+	// response.incomplete 让客户端干净地失败并重试。
+	terminalSeen := false
+	var responseSnapshot map[string]interface{}
+
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 
 		// 检查当前数据是否包含 completed 状态和 usage 信息
@@ -102,6 +110,16 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			// 解析失败时原样透传而不是丢事件（例如 created_at 为浮点的上游），
 			// 仅无法做 usage 记账与补丁。
 			logger.LogError(c, "failed to unmarshal stream response, relay raw data: "+err.Error())
+			if doc := parseResponsesStreamEventDoc(data); doc != nil {
+				if t, _ := doc["type"].(string); isResponsesTerminalEventType(t) {
+					terminalSeen = true
+				}
+				if responseSnapshot == nil {
+					if r, ok := doc["response"].(map[string]interface{}); ok {
+						responseSnapshot = r
+					}
+				}
+			}
 			sendResponsesStreamData(c, streamResponse, patchResponsesStreamEventUsage(data))
 			return
 		}
@@ -117,6 +135,16 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			sendData = patchResponsesStreamEventUsage(data)
 		}
 		sendResponsesStreamData(c, streamResponse, sendData)
+		if isResponsesTerminalEventType(streamResponse.Type) {
+			terminalSeen = true
+		}
+		if responseSnapshot == nil {
+			if doc := parseResponsesStreamEventDoc(data); doc != nil {
+				if r, ok := doc["response"].(map[string]interface{}); ok {
+					responseSnapshot = r
+				}
+			}
+		}
 		switch streamResponse.Type {
 		case "response.completed", "response.done":
 			if streamResponse.Response != nil {
@@ -205,9 +233,87 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 
+	// 上游流结束但未发任何终止事件（半死连接、上游崩溃、超时）：给客户端
+	// 合成 response.incomplete，让严格客户端（如 Codex）干净地失败并重试，
+	// 而不是无限等待。客户端已断开（client_gone）时跳过——写了也收不到。
+	if !terminalSeen && info.StreamStatus != nil &&
+		info.StreamStatus.EndReason != relaycommon.StreamEndReasonClientGone {
+		logger.LogWarn(c, fmt.Sprintf("responses stream ended without terminal event (reason=%s, received=%d), synthesizing response.incomplete",
+			info.StreamStatus.EndReason, info.ReceivedResponseCount))
+		if eventData := buildResponsesIncompleteEvent(responseSnapshot, info.StreamStatus.EndReason); eventData != "" {
+			_ = helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: "response.incomplete"}, eventData)
+		}
+	}
+
 	helper.Done(c)
 
 	return usage, nil
+}
+
+// isResponsesTerminalEventType reports whether a Responses stream event type
+// terminates the response lifecycle.
+func isResponsesTerminalEventType(eventType string) bool {
+	switch eventType {
+	case "response.completed", "response.done", "response.failed",
+		"response.incomplete", "response.cancelled", "response.canceled":
+		return true
+	}
+	return false
+}
+
+// parseResponsesStreamEventDoc decodes a raw stream event into a map,
+// preserving unknown fields. Returns nil when the data is not valid JSON.
+func parseResponsesStreamEventDoc(data string) map[string]interface{} {
+	var doc map[string]interface{}
+	if err := common.UnmarshalJsonStr(data, &doc); err != nil {
+		return nil
+	}
+	return doc
+}
+
+// buildResponsesIncompleteEvent builds a synthetic response.incomplete event
+// for streams that ended without a terminal event. It reuses the last seen
+// upstream response object (preserving id/model/etc.) and fills the fields a
+// strict client requires: integer created_at, status/incomplete_details, and
+// a zero usage with both detail objects. Returns "" when serialization fails.
+func buildResponsesIncompleteEvent(snapshot map[string]interface{}, endReason relaycommon.StreamEndReason) string {
+	resp := make(map[string]interface{}, len(snapshot)+6)
+	for k, v := range snapshot {
+		resp[k] = v
+	}
+	if _, ok := resp["id"]; !ok || resp["id"] == "" {
+		resp["id"] = "resp_" + common.GetRandomString(24)
+	}
+	resp["object"] = "response"
+	if _, ok := resp["created_at"]; !ok {
+		resp["created_at"] = time.Now().Unix()
+	}
+	resp["status"] = "incomplete"
+	reason := "upstream_eof"
+	if endReason == relaycommon.StreamEndReasonTimeout {
+		reason = "upstream_timeout"
+	}
+	resp["incomplete_details"] = map[string]interface{}{"reason": reason}
+	if _, ok := resp["usage"]; !ok {
+		resp["usage"] = map[string]interface{}{
+			"input_tokens":          0,
+			"input_tokens_details":  map[string]interface{}{"cached_tokens": 0},
+			"output_tokens":         0,
+			"output_tokens_details": map[string]interface{}{"reasoning_tokens": 0},
+			"total_tokens":          0,
+		}
+	}
+	// 复用现有补丁：created_at 取整 + usage 补 output_tokens_details。
+	patchResponsesUsageDoc(resp)
+	doc := map[string]interface{}{
+		"type":     "response.incomplete",
+		"response": resp,
+	}
+	patched, err := common.Marshal(doc)
+	if err != nil {
+		return ""
+	}
+	return string(patched)
 }
 
 // patchResponsesUsageDoc patches a decoded response object in place: rounds

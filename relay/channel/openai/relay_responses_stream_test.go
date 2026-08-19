@@ -204,3 +204,94 @@ func TestOaiResponsesStreamHandlerCompletedEventIncludesZeroOutputTokensDetails(
 		"output_tokens_details missing from response.completed event sent to client")
 	assert.Equal(t, 0, completedEvent.Response.Usage.OutputTokensDetails.ReasoningTokens)
 }
+
+// Regression test: an upstream stream that ends (EOF) without any terminal
+// event must not leave strict clients (e.g. Codex) waiting forever. The
+// handler synthesizes response.incomplete before the trailing [DONE].
+func TestOaiResponsesStreamHandlerSynthesizesIncompleteOnEOF(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() {
+		constant.StreamingTimeout = oldTimeout
+	})
+
+	events := []string{
+		`{"type":"response.created","sequence_number":0,"response":{"id":"resp_eof1","object":"response","created_at":1786885892,"status":"in_progress","model":"gpt-5.1","output":[]}}`,
+		`{"type":"response.output_item.added","sequence_number":3,"output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}`,
+	}
+	body := ""
+	for _, e := range events {
+		body += "data: " + e + "\n\n"
+	}
+	// 注意：没有 response.completed，也没有 [DONE]——上游直接 EOF。
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Set(common.RequestIdKey, "responses-stream-eof-test")
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "gpt-5.1",
+		DisablePing:     true,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: "gpt-5.1",
+		},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+
+	_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+
+	out := w.Body.String()
+	assert.Contains(t, out, "event: response.incomplete",
+		"must synthesize response.incomplete when upstream ends without terminal event")
+	assert.Contains(t, out, `"id":"resp_eof1"`,
+		"synthesized event must reuse the upstream response id")
+	assert.Contains(t, out, `"status":"incomplete"`)
+	assert.Contains(t, out, `"incomplete_details":{"reason":"upstream_eof"}`)
+	assert.Contains(t, out, `"output_tokens_details":{"reasoning_tokens":0}`,
+		"synthesized usage must carry output_tokens_details for strict clients")
+	assert.Contains(t, out, `"input_tokens_details":{"cached_tokens":0}`,
+		"synthesized usage must carry input_tokens_details for strict clients")
+	assert.True(t, strings.HasSuffix(strings.TrimSpace(out), "data: [DONE]"),
+		"stream must still end with [DONE]")
+}
+
+// 正常收到终止事件的流不得再合成 response.incomplete。
+func TestOaiResponsesStreamHandlerNoSynthesisOnCompleted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() {
+		constant.StreamingTimeout = oldTimeout
+	})
+
+	completed := `{"type":"response.completed","response":{"id":"resp_ok","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`
+	body := "data: " + completed + "\n\n" + "data: [DONE]\n\n"
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Set(common.RequestIdKey, "responses-stream-no-synthesis-test")
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "gpt-5.1",
+		DisablePing:     true,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: "gpt-5.1",
+		},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+
+	_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	assert.NotContains(t, w.Body.String(), "response.incomplete",
+		"normal completed stream must not get a synthesized incomplete event")
+}
