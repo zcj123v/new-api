@@ -22,9 +22,11 @@ const (
 	responsesEventOutputItemDone           = "response.output_item.done"
 	responsesEventFunctionArgsDelta        = "response.function_call_arguments.delta"
 	responsesEventFunctionArgsDone         = "response.function_call_arguments.done"
+	responsesEventCustomToolInputDone      = "response.custom_tool_call_input.done"
 	responsesEventReasoningSummaryDelta    = "response.reasoning_summary_text.delta"
 	responsesEventReasoningSummaryDone     = "response.reasoning_summary_text.done"
 	responsesOutputTypeFunctionCall        = "function_call"
+	responsesOutputTypeCustomToolCall      = "custom_tool_call"
 	responsesOutputTypeMessage             = "message"
 	responsesOutputTypeReasoning           = "reasoning"
 	responsesIncompleteReasonContentFilter = "content_filter"
@@ -32,6 +34,13 @@ const (
 )
 
 func ChatCompletionsResponseToResponsesResponse(resp *dto.OpenAITextResponse, id string) (*dto.OpenAIResponsesResponse, *dto.Usage, error) {
+	return ChatCompletionsResponseToResponsesResponseWithCustomTools(resp, id, nil)
+}
+
+// ChatCompletionsResponseToResponsesResponseWithCustomTools converts a chat
+// response to Responses format, mapping function calls whose names are in
+// customTools back to custom_tool_call items (unwrapping {"input": "..."}).
+func ChatCompletionsResponseToResponsesResponseWithCustomTools(resp *dto.OpenAITextResponse, id string, customTools map[string]bool) (*dto.OpenAIResponsesResponse, *dto.Usage, error) {
 	if resp == nil {
 		return nil, nil, errors.New("response is nil")
 	}
@@ -87,7 +96,7 @@ func ChatCompletionsResponseToResponsesResponse(resp *dto.OpenAITextResponse, id
 	}
 
 	for i, toolCall := range choice.Message.ParseToolCalls() {
-		toolOutput, err := chatToolCallToResponsesOutput(toolCall, id, i, responseOutputStatus(out))
+		toolOutput, err := chatToolCallToResponsesOutput(toolCall, id, i, responseOutputStatus(out), customTools)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -188,18 +197,31 @@ func responseStatusString(resp *dto.OpenAIResponsesResponse) string {
 	return strings.TrimSpace(status)
 }
 
-func chatToolCallToResponsesOutput(toolCall dto.ToolCallRequest, responseID string, index int, status string) (dto.ResponsesOutput, error) {
+func chatToolCallToResponsesOutput(toolCall dto.ToolCallRequest, responseID string, index int, status string, customTools map[string]bool) (dto.ResponsesOutput, error) {
 	callID := strings.TrimSpace(toolCall.ID)
 	if callID == "" {
 		callID = fmt.Sprintf("%s_call_%d", responseID, index)
 	}
 	if toolCall.Type == "" || toolCall.Type == "function" {
+		name := toolCall.Function.Name
+		if customTools[name] {
+			// 伪装成 function 的 freeform 工具：还原为 custom_tool_call，
+			// arguments {"input": "..."} 解包回 input 字符串。
+			return dto.ResponsesOutput{
+				Type:   "custom_tool_call",
+				ID:     callID,
+				Status: status,
+				CallId: callID,
+				Name:   name,
+				Input:  kitutil.UnwrapCustomToolInput(toolCall.Function.Arguments),
+			}, nil
+		}
 		return dto.ResponsesOutput{
 			Type:      responsesOutputTypeFunctionCall,
 			ID:        callID,
 			Status:    status,
 			CallId:    callID,
-			Name:      toolCall.Function.Name,
+			Name:      name,
 			Arguments: chatArgumentsRawMessage(toolCall.Function.Arguments),
 		}, nil
 	}

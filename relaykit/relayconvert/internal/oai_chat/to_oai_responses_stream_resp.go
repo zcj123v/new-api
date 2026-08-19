@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 )
 
 type ChatToResponsesStreamEvent struct {
@@ -19,6 +20,10 @@ type ChatToResponsesStreamState struct {
 	Model   string
 	Created int64
 	Usage   *dto.Usage
+
+	// CustomTools 记录请求侧被伪装成 function 的 freeform 工具名；
+	// 命中名字的 tool call 还原为 custom_tool_call 事件序列。
+	CustomTools map[string]bool
 
 	status            string
 	incompleteDetails *dto.IncompleteDetails
@@ -42,6 +47,7 @@ type chatToResponsesStreamTool struct {
 	OutputIndex int
 	ID          string
 	Name        string
+	IsCustom    bool
 	Arguments   strings.Builder
 	Done        bool
 }
@@ -209,34 +215,59 @@ func (s *ChatToResponsesStreamState) appendToolCallDelta(toolCall dto.ToolCallRe
 			tool.ID = fmt.Sprintf("%s_call_%d", s.ID, chatIndex)
 		}
 		s.toolsByIndex[chatIndex] = tool
-		events = append(events, responsesStreamEvent(responsesEventOutputItemAdded, dto.ResponsesStreamResponse{
-			Type:        responsesEventOutputItemAdded,
-			OutputIndex: intPtr(tool.OutputIndex),
-			ItemID:      tool.ID,
-			Item: &dto.ResponsesOutput{
-				Type:      responsesOutputTypeFunctionCall,
-				ID:        tool.ID,
-				Status:    "in_progress",
-				CallId:    tool.ID,
-				Name:      tool.Name,
-				Arguments: []byte(`""`),
-			},
-		}))
+		if toolCall.Function.Name != "" {
+			tool.Name = strings.TrimSpace(toolCall.Function.Name)
+		}
+		tool.IsCustom = s.CustomTools[tool.Name]
+		if tool.IsCustom {
+			// freeform 工具：item 类型为 custom_tool_call；arguments 流暂存，
+			// 完成时解包 {"input": "..."} 一次性发出，不做半成品 JSON 解包。
+			events = append(events, responsesStreamEvent(responsesEventOutputItemAdded, dto.ResponsesStreamResponse{
+				Type:        responsesEventOutputItemAdded,
+				OutputIndex: intPtr(tool.OutputIndex),
+				ItemID:      tool.ID,
+				Item: &dto.ResponsesOutput{
+					Type:   responsesOutputTypeCustomToolCall,
+					ID:     tool.ID,
+					Status: "in_progress",
+					CallId: tool.ID,
+					Name:   tool.Name,
+					Input:  "",
+				},
+			}))
+		} else {
+			events = append(events, responsesStreamEvent(responsesEventOutputItemAdded, dto.ResponsesStreamResponse{
+				Type:        responsesEventOutputItemAdded,
+				OutputIndex: intPtr(tool.OutputIndex),
+				ItemID:      tool.ID,
+				Item: &dto.ResponsesOutput{
+					Type:      responsesOutputTypeFunctionCall,
+					ID:        tool.ID,
+					Status:    "in_progress",
+					CallId:    tool.ID,
+					Name:      tool.Name,
+					Arguments: []byte(`""`),
+				},
+			}))
+		}
 	}
 	if strings.TrimSpace(toolCall.ID) != "" {
 		tool.ID = strings.TrimSpace(toolCall.ID)
 	}
 	if strings.TrimSpace(toolCall.Function.Name) != "" {
 		tool.Name = strings.TrimSpace(toolCall.Function.Name)
+		tool.IsCustom = s.CustomTools[tool.Name]
 	}
 	if toolCall.Function.Arguments != "" {
 		tool.Arguments.WriteString(toolCall.Function.Arguments)
-		events = append(events, responsesStreamEvent(responsesEventFunctionArgsDelta, dto.ResponsesStreamResponse{
-			Type:        responsesEventFunctionArgsDelta,
-			OutputIndex: intPtr(tool.OutputIndex),
-			ItemID:      tool.ID,
-			Delta:       toolCall.Function.Arguments,
-		}))
+		if !tool.IsCustom {
+			events = append(events, responsesStreamEvent(responsesEventFunctionArgsDelta, dto.ResponsesStreamResponse{
+				Type:        responsesEventFunctionArgsDelta,
+				OutputIndex: intPtr(tool.OutputIndex),
+				ItemID:      tool.ID,
+				Delta:       toolCall.Function.Arguments,
+			}))
+		}
 	}
 	return events, nil
 }
@@ -281,11 +312,20 @@ func (s *ChatToResponsesStreamState) doneDeltaEvents() []ChatToResponsesStreamEv
 			continue
 		}
 		tool.Done = true
-		events = append(events, responsesStreamEvent(responsesEventFunctionArgsDone, dto.ResponsesStreamResponse{
-			Type:        responsesEventFunctionArgsDone,
-			OutputIndex: intPtr(tool.OutputIndex),
-			ItemID:      tool.ID,
-		}))
+		if tool.IsCustom {
+			events = append(events, responsesStreamEvent(responsesEventCustomToolInputDone, dto.ResponsesStreamResponse{
+				Type:        responsesEventCustomToolInputDone,
+				OutputIndex: intPtr(tool.OutputIndex),
+				ItemID:      tool.ID,
+				Input:       kitutil.UnwrapCustomToolInput(tool.Arguments.String()),
+			}))
+		} else {
+			events = append(events, responsesStreamEvent(responsesEventFunctionArgsDone, dto.ResponsesStreamResponse{
+				Type:        responsesEventFunctionArgsDone,
+				OutputIndex: intPtr(tool.OutputIndex),
+				ItemID:      tool.ID,
+			}))
+		}
 		events = append(events, responsesStreamEvent(responsesEventOutputItemDone, dto.ResponsesStreamResponse{
 			Type:        responsesEventOutputItemDone,
 			OutputIndex: intPtr(tool.OutputIndex),
@@ -406,6 +446,16 @@ func (s *ChatToResponsesStreamState) reasoningOutput(status string) *dto.Respons
 }
 
 func (s *ChatToResponsesStreamState) toolOutput(tool *chatToResponsesStreamTool, status string) *dto.ResponsesOutput {
+	if tool.IsCustom {
+		return &dto.ResponsesOutput{
+			Type:   responsesOutputTypeCustomToolCall,
+			ID:     tool.ID,
+			Status: status,
+			CallId: tool.ID,
+			Name:   tool.Name,
+			Input:  kitutil.UnwrapCustomToolInput(tool.Arguments.String()),
+		}
+	}
 	return &dto.ResponsesOutput{
 		Type:      responsesOutputTypeFunctionCall,
 		ID:        tool.ID,

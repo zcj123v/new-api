@@ -189,3 +189,103 @@ func TestUsageFromChatUsagePreservesExistingOutputTokensDetails(t *testing.T) {
 	require.NotNil(t, usage.OutputTokensDetails)
 	assert.Equal(t, 7, usage.OutputTokensDetails.ReasoningTokens)
 }
+
+// 伪装成 function 的 freeform 工具（Codex apply_patch）：命中 customTools
+// 名字的 function_call 必须还原为 custom_tool_call，arguments 解包回 input。
+func TestChatCompletionsResponseToResponsesMapsCustomToolCall(t *testing.T) {
+	chat := &dto.OpenAITextResponse{
+		Id:    "chatcmpl_1",
+		Model: "gpt-test",
+		Choices: []dto.OpenAITextResponseChoice{
+			{
+				Message:      assistantMessageWithTool("", "call_1", "apply_patch", `{"input":"*** Begin Patch"}`),
+				FinishReason: "tool_calls",
+			},
+		},
+	}
+
+	resp, _, err := ChatCompletionsResponseToResponsesResponseWithCustomTools(chat, "resp_1", map[string]bool{"apply_patch": true})
+	require.NoError(t, err)
+	require.Len(t, resp.Output, 1)
+	assert.Equal(t, responsesOutputTypeCustomToolCall, resp.Output[0].Type)
+	assert.Equal(t, "call_1", resp.Output[0].CallId)
+	assert.Equal(t, "apply_patch", resp.Output[0].Name)
+	assert.Equal(t, "*** Begin Patch", resp.Output[0].Input)
+	assert.Empty(t, resp.Output[0].Arguments)
+
+	// 不在 customTools 里的同名调用保持 function_call（nil map 也安全）
+	resp2, _, err := ChatCompletionsResponseToResponsesResponseWithCustomTools(chat, "resp_1", nil)
+	require.NoError(t, err)
+	require.Len(t, resp2.Output, 1)
+	assert.Equal(t, responsesOutputTypeFunctionCall, resp2.Output[0].Type)
+}
+
+// 流式方向：custom 工具不发 function_call_arguments.*，完成时一次性发
+// response.custom_tool_call_input.done + custom_tool_call 的 output_item.done。
+func TestChatCompletionsStreamToResponsesEventsCustomToolCall(t *testing.T) {
+	state := NewChatToResponsesStreamState("resp_1", "gpt-test")
+	state.CustomTools = map[string]bool{"apply_patch": true}
+	toolIndex := 0
+
+	var events []ChatToResponsesStreamEvent
+	events = append(events, mustResponsesEventsFromChatChunk(t, state, &dto.ChatCompletionsStreamResponse{
+		Choices: []dto.ChatCompletionsStreamResponseChoice{
+			{Index: 0, Delta: dto.ChatCompletionsStreamResponseChoiceDelta{ToolCalls: []dto.ToolCallResponse{
+				{Index: &toolIndex, ID: "call_1", Type: "function", Function: dto.FunctionResponse{Name: "apply_patch"}},
+			}}},
+		},
+	})...)
+	events = append(events, mustResponsesEventsFromChatChunk(t, state, &dto.ChatCompletionsStreamResponse{
+		Choices: []dto.ChatCompletionsStreamResponseChoice{
+			{Index: 0, Delta: dto.ChatCompletionsStreamResponseChoiceDelta{ToolCalls: []dto.ToolCallResponse{
+				{Index: &toolIndex, Function: dto.FunctionResponse{Arguments: `{"input":"*** Begin`}},
+			}}},
+		},
+	})...)
+	events = append(events, mustResponsesEventsFromChatChunk(t, state, &dto.ChatCompletionsStreamResponse{
+		Choices: []dto.ChatCompletionsStreamResponseChoice{
+			{Index: 0, Delta: dto.ChatCompletionsStreamResponseChoiceDelta{ToolCalls: []dto.ToolCallResponse{
+				{Index: &toolIndex, Function: dto.FunctionResponse{Arguments: ` Patch"}`}},
+			}}},
+		},
+	})...)
+	finishReason := "tool_calls"
+	events = append(events, mustResponsesEventsFromChatChunk(t, state, &dto.ChatCompletionsStreamResponse{
+		Choices: []dto.ChatCompletionsStreamResponseChoice{
+			{Index: 0, FinishReason: &finishReason},
+		},
+	})...)
+	events = append(events, FinalizeChatCompletionsStreamToResponses(state)...)
+
+	for _, e := range events {
+		assert.NotEqual(t, responsesEventFunctionArgsDelta, e.Type, "custom tool must not emit function args deltas")
+		assert.NotEqual(t, responsesEventFunctionArgsDone, e.Type, "custom tool must not emit function args done")
+	}
+
+	var added, inputDone, itemDone, completed *ChatToResponsesStreamEvent
+	for i := range events {
+		switch events[i].Type {
+		case responsesEventOutputItemAdded:
+			added = &events[i]
+		case responsesEventCustomToolInputDone:
+			inputDone = &events[i]
+		case responsesEventOutputItemDone:
+			itemDone = &events[i]
+		case responsesEventCompleted:
+			completed = &events[i]
+		}
+	}
+	require.NotNil(t, added)
+	assert.Equal(t, responsesOutputTypeCustomToolCall, added.Payload.Item.Type)
+	assert.Equal(t, "apply_patch", added.Payload.Item.Name)
+	require.NotNil(t, inputDone)
+	assert.Equal(t, "*** Begin Patch", inputDone.Payload.Input)
+	require.NotNil(t, itemDone)
+	assert.Equal(t, responsesOutputTypeCustomToolCall, itemDone.Payload.Item.Type)
+	assert.Equal(t, "*** Begin Patch", itemDone.Payload.Item.Input)
+	require.NotNil(t, completed)
+	require.NotNil(t, completed.Payload.Response)
+	require.Len(t, completed.Payload.Response.Output, 1)
+	assert.Equal(t, responsesOutputTypeCustomToolCall, completed.Payload.Response.Output[0].Type)
+	assert.Equal(t, "*** Begin Patch", completed.Payload.Response.Output[0].Input)
+}

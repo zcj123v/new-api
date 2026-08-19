@@ -84,6 +84,10 @@ func ChatCompletionsResponseToResponsesResponse(resp *dto.OpenAITextResponse, id
 	return oaichat.ChatCompletionsResponseToResponsesResponse(resp, id)
 }
 
+func ChatCompletionsResponseToResponsesResponseWithCustomTools(resp *dto.OpenAITextResponse, id string, customTools map[string]bool) (*dto.OpenAIResponsesResponse, *dto.Usage, error) {
+	return oaichat.ChatCompletionsResponseToResponsesResponseWithCustomTools(resp, id, customTools)
+}
+
 func ResponsesStatusFromChatFinishReason(finishReason string) (string, *dto.IncompleteDetails) {
 	return oaichat.ResponsesStatusFromChatFinishReason(finishReason)
 }

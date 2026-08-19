@@ -232,7 +232,7 @@ func TestResponsesRequestToChatCompletionsRequestToolsToolChoiceAndTextFormat(t 
 	assert.True(t, gjson.GetBytes(got.ResponseFormat.JsonSchema, "strict").Bool())
 }
 
-func TestResponsesRequestToChatCompletionsRequestCustomToolCallPreservesRawShape(t *testing.T) {
+func TestResponsesRequestToChatCompletionsRequestCustomToolCallDisguisedAsFunction(t *testing.T) {
 	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
 		Model: "gpt-test",
 		Input: mustRawMessage(t, []map[string]any{
@@ -242,19 +242,69 @@ func TestResponsesRequestToChatCompletionsRequestCustomToolCallPreservesRawShape
 				"name":    "apply_patch",
 				"input":   "patch body",
 			},
+			{
+				"type":    "custom_tool_call_output",
+				"call_id": "call_custom",
+				"output":  "patch applied",
+			},
 		}),
 	})
 	require.NoError(t, err)
 
-	require.Len(t, got.Messages, 1)
+	// custom_tool_call → 伪装成 function 调用，input 包成 {"input": "..."}
+	require.Len(t, got.Messages, 2)
 	toolCalls := got.Messages[0].ParseToolCalls()
 	require.Len(t, toolCalls, 1)
-	assert.Equal(t, dto.CustomType, toolCalls[0].Type)
+	assert.Equal(t, "function", toolCalls[0].Type)
 	assert.Equal(t, "call_custom", toolCalls[0].ID)
 	assert.Equal(t, "apply_patch", toolCalls[0].Function.Name)
-	assert.Equal(t, "patch body", toolCalls[0].Function.Arguments)
-	assert.Equal(t, "custom_tool_call", gjson.GetBytes(toolCalls[0].Custom, "type").String())
-	assert.Equal(t, "patch body", gjson.GetBytes(toolCalls[0].Custom, "input").String())
+	assert.Equal(t, `{"input":"patch body"}`, toolCalls[0].Function.Arguments)
+	assert.Empty(t, toolCalls[0].Custom)
+
+	// custom_tool_call_output → tool 消息（此前会漏成空 user 消息）
+	assert.Equal(t, "tool", got.Messages[1].Role)
+	assert.Equal(t, "call_custom", got.Messages[1].ToolCallId)
+	assert.Equal(t, "patch applied", got.Messages[1].StringContent())
+}
+
+// freeform 工具声明必须伪装成普通 function：chat 上游只认 function/plugin，
+// 原样透传 type:"custom" 会被上游拒绝（unknown tool type: custom）。
+func TestResponsesRequestToChatCompletionsRequestCustomToolDeclarationDisguised(t *testing.T) {
+	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+		Model: "gpt-test",
+		Input: mustRawMessage(t, "hi"),
+		Tools: mustRawMessage(t, []map[string]any{
+			{
+				"type":        "custom",
+				"name":        "apply_patch",
+				"description": "Apply a patch",
+				"format":      map[string]any{"type": "grammar", "syntax": "lark", "description": "patch grammar"},
+			},
+			{"type": "function", "name": "exec", "description": "run", "parameters": map[string]any{"type": "object"}},
+		}),
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Tools, 2)
+
+	custom := got.Tools[0]
+	assert.Equal(t, "function", custom.Type, "custom tool must be disguised as function")
+	assert.Equal(t, "apply_patch", custom.Function.Name)
+	assert.Contains(t, custom.Function.Description, "Apply a patch")
+	assert.Contains(t, custom.Function.Description, "patch grammar")
+	params, ok := custom.Function.Parameters.(map[string]any)
+	require.True(t, ok)
+	assert.Contains(t, params["required"], "input")
+	props, ok := params["properties"].(map[string]any)
+	require.True(t, ok)
+	require.Contains(t, props, "input")
+
+	assert.Equal(t, "exec", got.Tools[1].Function.Name)
+
+	names := CollectResponsesCustomToolNames(mustRawMessage(t, []map[string]any{
+		{"type": "custom", "name": "apply_patch"},
+		{"type": "function", "name": "exec"},
+	}))
+	assert.Equal(t, []string{"apply_patch"}, names)
 }
 
 func TestResponsesRequestToChatCompletionsRequestRejectsStatefulFields(t *testing.T) {

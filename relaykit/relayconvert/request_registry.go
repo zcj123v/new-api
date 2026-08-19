@@ -485,7 +485,7 @@ func convertOpenAIResponsesRequestToGeminiChat(c context.Context, info convmeta.
 	return oairesponses.OpenAIResponsesRequestToGeminiChat(c, &prepared, info)
 }
 
-func convertResponsesRequestToChat(_ context.Context, _ convmeta.Meta, request any) (any, error) {
+func convertResponsesRequestToChat(c context.Context, _ convmeta.Meta, request any) (any, error) {
 	responsesRequest, ok := request.(*dto.OpenAIResponsesRequest)
 	if !ok {
 		if value, ok := request.(dto.OpenAIResponsesRequest); ok {
@@ -495,5 +495,7 @@ func convertResponsesRequestToChat(_ context.Context, _ convmeta.Meta, request a
 	if responsesRequest == nil {
 		return nil, fmt.Errorf("expected OpenAI responses request, got %T", request)
 	}
+	// 记录被伪装成 function 的 custom（freeform）工具名，供响应方向还原。
+	stashResponsesCustomToolNames(c, oairesponses.CollectResponsesCustomToolNames(responsesRequest.Tools))
 	return oairesponses.ResponsesRequestToChatCompletionsRequest(responsesRequest)
 }

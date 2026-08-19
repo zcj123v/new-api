@@ -188,7 +188,7 @@ func responsesInputItemToChatMessages(item map[string]any, messages []dto.Messag
 			return nil, err
 		}
 		return appendToolCallToLastAssistant(messages, toolCall), nil
-	case responsesInputTypeFunctionCallOutput:
+	case responsesInputTypeFunctionCallOutput, responsesInputTypeCustomToolOutput:
 		callID := strings.TrimSpace(kitutil.Interface2String(item["call_id"]))
 		content := responseToolOutputToChatContent(item["output"])
 		return append(messages, dto.Message{Role: "tool", ToolCallId: callID, Content: content}), nil
@@ -300,17 +300,18 @@ func responsesFunctionCallItemToChatToolCall(item map[string]any) (dto.ToolCallR
 }
 
 func responsesCustomToolCallItemToChatToolCall(item map[string]any) (dto.ToolCallRequest, error) {
-	raw, err := kitutil.Marshal(item)
-	if err != nil {
-		return dto.ToolCallRequest{}, err
+	name := strings.TrimSpace(kitutil.Interface2String(item["name"]))
+	if name == "" {
+		return dto.ToolCallRequest{}, errors.New("custom_tool_call item is missing name")
 	}
+	// 伪装成普通 function：freeform input 包成 {"input": "..."}，与
+	// responsesRequestToolsToChat 的 custom 工具声明伪装保持一致。
 	return dto.ToolCallRequest{
-		ID:     responsesCallID(item),
-		Type:   dto.CustomType,
-		Custom: raw,
+		ID:   responsesCallID(item),
+		Type: "function",
 		Function: dto.FunctionRequest{
-			Name:      strings.TrimSpace(kitutil.Interface2String(item["name"])),
-			Arguments: responsesArgumentsString(item["input"]),
+			Name:      name,
+			Arguments: kitutil.WrapCustomToolInput(responsesArgumentsString(item["input"])),
 		},
 	}, nil
 }
@@ -353,6 +354,42 @@ func responsesRequestToolsToChat(raw json.RawMessage) ([]dto.ToolCallRequest, er
 			continue
 		}
 
+		if toolType == dto.CustomType {
+			// freeform 工具（如 Codex 的 apply_patch）：chat 上游只认 function，
+			// 伪装成 {"input": "..."} 单参数函数；响应方向按工具名还原。
+			name := strings.TrimSpace(kitutil.Interface2String(tool["name"]))
+			if name == "" {
+				continue
+			}
+			description := kitutil.Interface2String(tool["description"])
+			if format, ok := tool["format"].(map[string]any); ok {
+				if formatDesc := strings.TrimSpace(kitutil.Interface2String(format["description"])); formatDesc != "" {
+					if description != "" {
+						description += "\n\n"
+					}
+					description += "Input format: " + formatDesc
+				}
+			}
+			out = append(out, dto.ToolCallRequest{
+				Type: "function",
+				Function: dto.FunctionRequest{
+					Name:        name,
+					Description: description,
+					Parameters: map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"input": map[string]any{
+								"type":        "string",
+								"description": "The complete freeform input for this tool.",
+							},
+						},
+						"required": []string{"input"},
+					},
+				},
+			})
+			continue
+		}
+
 		rawTool, err := kitutil.Marshal(tool)
 		if err != nil {
 			return nil, err
@@ -363,6 +400,29 @@ func responsesRequestToolsToChat(raw json.RawMessage) ([]dto.ToolCallRequest, er
 		})
 	}
 	return out, nil
+}
+
+// CollectResponsesCustomToolNames returns the names of freeform (custom) tools
+// declared in a Responses request. The chat-side response converter uses the
+// names to map disguised function calls back to custom_tool_call items.
+func CollectResponsesCustomToolNames(raw json.RawMessage) []string {
+	if !rawJSONPresent(raw) {
+		return nil
+	}
+	var tools []map[string]any
+	if err := kitutil.Unmarshal(raw, &tools); err != nil {
+		return nil
+	}
+	names := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		if strings.TrimSpace(kitutil.Interface2String(tool["type"])) != dto.CustomType {
+			continue
+		}
+		if name := strings.TrimSpace(kitutil.Interface2String(tool["name"])); name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 func responsesRequestToolChoiceToChat(raw json.RawMessage) (any, error) {
