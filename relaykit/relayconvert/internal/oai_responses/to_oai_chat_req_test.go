@@ -623,3 +623,32 @@ func TestResponsesRequestToChatCompletionsRequestToolSearchInputItems(t *testing
 	assert.Equal(t, "tool", got.Messages[1].Role)
 	assert.Equal(t, "ts_1", got.Messages[1].ToolCallId)
 }
+
+// chat 上游无 developer 角色（Kimi 等 400 "role developer is not allowed"），
+// 必须映射为 system。
+func TestResponsesRequestToChatCompletionsRequestMapsDeveloperRoleToSystem(t *testing.T) {
+	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+		Model: "gpt-test",
+		Input: mustRawMessage(t, []map[string]any{
+			{
+				"type": "message",
+				"role": "developer",
+				"content": []map[string]any{
+					{"type": "input_text", "text": "Follow these rules."},
+				},
+			},
+			{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]any{
+					{"type": "input_text", "text": "hi"},
+				},
+			},
+		}),
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Messages, 2)
+	assert.Equal(t, "system", got.Messages[0].Role)
+	assert.Equal(t, "Follow these rules.", got.Messages[0].StringContent())
+	assert.Equal(t, "user", got.Messages[1].Role)
+}

@@ -274,6 +274,11 @@ func responsesInputItemToChatMessages(item map[string]any, messages []dto.Messag
 	if role == "" {
 		role = "user"
 	}
+	if role == "developer" {
+		// chat 上游无 developer 角色（Kimi 等会 400 role not allowed），
+		// 语义上等同系统指令，映射为 system。
+		role = "system"
+	}
 	content, err := responsesInputContentToChatContent(item["content"])
 	if err != nil {
 		return nil, err
