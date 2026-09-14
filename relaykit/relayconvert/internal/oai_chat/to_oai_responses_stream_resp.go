@@ -64,7 +64,6 @@ type chatToResponsesStreamTool struct {
 	Arguments    strings.Builder
 	Done         bool
 }
-}
 
 type chatToResponsesOutputRef struct {
 	Kind      string
