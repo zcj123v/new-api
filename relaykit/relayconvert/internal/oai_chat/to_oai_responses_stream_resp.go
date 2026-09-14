@@ -47,6 +47,7 @@ type ChatToResponsesStreamState struct {
 	nextOutputIndex    int
 	toolsByIndex       map[int]*chatToResponsesStreamTool
 	hostedByID         map[string]*chatToResponsesHostedTool
+	droppedToolCalls   int
 	outputOrder        []chatToResponsesOutputRef
 	text               strings.Builder
 	annotations        []any
