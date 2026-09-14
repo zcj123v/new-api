@@ -845,9 +845,9 @@ func (s *ChatToResponsesStreamState) toolOutput(tool *chatToResponsesStreamTool,
 	if tool.IsToolSearch {
 		return &dto.ResponsesOutput{
 			Type:      responsesOutputTypeToolSearchCall,
-			ID:        tool.ID,
+			ID:        tool.ItemID,
 			Status:    status,
-			CallId:    tool.ID,
+			CallId:    tool.callID(),
 			Execution: "client",
 			Arguments: chatArgumentsObjectRawMessage(tool.Arguments.String()),
 		}
@@ -855,9 +855,9 @@ func (s *ChatToResponsesStreamState) toolOutput(tool *chatToResponsesStreamTool,
 	if tool.IsCustom {
 		return &dto.ResponsesOutput{
 			Type:   responsesOutputTypeCustomToolCall,
-			ID:     tool.ID,
+			ID:     tool.ItemID,
 			Status: status,
-			CallId: tool.ID,
+			CallId: tool.callID(),
 			Name:   tool.Name,
 			Input:  kitutil.UnwrapCustomToolInput(tool.Arguments.String()),
 		}
