@@ -510,7 +510,6 @@ func NormalizeResponsesWebSearchAction(raw json.RawMessage) (json.RawMessage, er
 		return nil, fmt.Errorf("encode Responses web-search action: %w", err)
 	}
 	return encoded, nil
->>>>>>> upstream-rc37
 }
 
 // ArgumentsString returns function call arguments in the string form expected by Chat Completions.
