@@ -125,6 +125,35 @@ func TestResponsesRequestToChatCompletionsRequestMultimodalInput(t *testing.T) {
 	assert.Equal(t, "https://example.test/v.mp4", parts[4].GetVideoUrl().Url)
 }
 
+// 回归：Responses 的 input_image.image_url 是字符串，chat 侧要求 {"url": ...} 对象。
+// 直接透传字符串会被严格上游（iottepa）以 400 Invalid input
+// （param: messages.0.content）拒绝；detail 也必须一并带上而不是丢弃。
+func TestResponsesRequestToChatCompletionsRequestWrapsStringImageURL(t *testing.T) {
+	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+		Model: "gpt-test",
+		Input: mustRawMessage(t, []map[string]any{
+			{
+				"role": "user",
+				"content": []map[string]any{
+					{"type": "input_text", "text": "look"},
+					{"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "low"},
+					{"type": "input_image", "image_url": map[string]any{"url": "https://example.test/b.png"}},
+				},
+			},
+		}),
+	})
+	require.NoError(t, err)
+
+	raw, err := kitutil.Marshal(got)
+	require.NoError(t, err)
+
+	assert.True(t, gjson.GetBytes(raw, "messages.0.content.1.image_url").IsObject(),
+		"string image_url must be wrapped into an object for chat upstreams")
+	assert.Equal(t, "data:image/png;base64,AAAA", gjson.GetBytes(raw, "messages.0.content.1.image_url.url").String())
+	assert.Equal(t, "low", gjson.GetBytes(raw, "messages.0.content.1.image_url.detail").String())
+	assert.Equal(t, "https://example.test/b.png", gjson.GetBytes(raw, "messages.0.content.2.image_url.url").String())
+}
+
 func TestResponsesRequestToChatCompletionsRequestAssistantTextAndFunctionCallCoexist(t *testing.T) {
 	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
 		Model: "gpt-test",

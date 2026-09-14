@@ -818,9 +818,24 @@ func RequestTextToChatResponseFormat(raw json.RawMessage) (*dto.ResponseFormat, 
 	return responsesRequestTextToChatResponseFormat(raw)
 }
 
+// responsesImagePartToChatImageURL 把 Responses 的 input_image 片段转成 chat 侧的
+// image_url。Responses 规范里 image_url 是字符串（URL 或 data URL），而 chat 规范
+// 要求对象 {"url": ...}；直接把字符串透传出去会被严格上游（如 iottepa）以
+// 400 Invalid input（param: messages.0.content）拒绝。此函数与
+// normalizeChatImageURLToString 互为镜像。已是对象的输入原样保留，detail 一并带上。
 func responsesImagePartToChatImageURL(part map[string]any) any {
 	if imageURL, ok := part["image_url"]; ok {
-		return imageURL
+		switch v := imageURL.(type) {
+		case map[string]any:
+			return v
+		case dto.MessageImageUrl:
+			return chatImageURLObject(v.Url, v.Detail)
+		case *dto.MessageImageUrl:
+			if v != nil {
+				return chatImageURLObject(v.Url, v.Detail)
+			}
+		}
+		return chatImageURLObject(kitutil.Interface2String(imageURL), kitutil.Interface2String(part["detail"]))
 	}
 	imageURL := map[string]any{}
 	for _, key := range []string{"url", "file_id", "detail"} {
@@ -830,6 +845,14 @@ func responsesImagePartToChatImageURL(part map[string]any) any {
 	}
 	if len(imageURL) == 0 {
 		return part
+	}
+	return imageURL
+}
+
+func chatImageURLObject(url string, detail string) map[string]any {
+	imageURL := map[string]any{"url": url}
+	if detail != "" {
+		imageURL["detail"] = detail
 	}
 	return imageURL
 }
