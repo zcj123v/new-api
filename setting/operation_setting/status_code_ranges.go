@@ -17,19 +17,24 @@ type StatusCodeRange struct {
 var AutomaticDisableStatusCodeRanges = []StatusCodeRange{{Start: 401, End: 401}}
 
 // Default behavior matches legacy hardcoded retry rules in controller/relay.go shouldRetry:
-// retry for 1xx, 3xx, 4xx(except 400/408), 5xx(except 504/524), and no retry for 2xx.
+// retry for 1xx, 3xx, 4xx(except 400/408), 5xx(except 524), and no retry for 2xx.
+//
+// Fork deviation: upstream excludes 504 from retries as well. We keep 504
+// retryable because our gateways sit behind upstreams that answer 504 with a
+// bare "stream timeout" body after their own proxy timeout, and giving up
+// there costs the client a five-minute stall with no failover. 524 stays
+// non-retryable (Cloudflare origin timeout).
 var AutomaticRetryStatusCodeRanges = []StatusCodeRange{
 	{Start: 100, End: 199},
 	{Start: 300, End: 399},
 	{Start: 401, End: 407},
 	{Start: 409, End: 499},
-	{Start: 500, End: 503},
+	{Start: 500, End: 504},
 	{Start: 505, End: 523},
 	{Start: 525, End: 599},
 }
 
 var alwaysSkipRetryStatusCodes = map[int]struct{}{
-	504: {},
 	524: {},
 }
 
