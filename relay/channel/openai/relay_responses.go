@@ -4,19 +4,20 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
-	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
@@ -36,20 +37,23 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
 
+	info.ObserveResponseModel(responsesResponse.Model)
+
 	// 默认原始透传响应体：typed struct 重序列化会丢失上游字段（如
 	// custom_tool_call 的 input、reasoning 的 encrypted_content）。仅在缺
 	// output_tokens_details 时做 map 级补丁（保留所有未知字段）。
 	// Some upstreams (e.g. Moonshot/Kimi) report reasoning_tokens at the top
 	// level of usage rather than inside output_tokens_details, while strict
 	// clients require the field.
-	outBody := responseBody
+	outBody := rewriteSGLangResponsesCreatedAt(info, responseBody, "created_at", responsesResponse.CreatedAt)
 	if responsesResponse.Usage != nil && responsesResponse.Usage.OutputTokensDetails == nil {
-		outBody = patchResponsesBodyUsage(responseBody)
+		outBody = patchResponsesBodyUsage(outBody)
 	}
 	service.IOCopyBytesGracefully(c, resp, outBody)
 
 	// compute usage
-	usage := relayconvert.NormalizeResponsesUsage(responsesResponse.Usage)
+	usage := &dto.Usage{}
+	service.ApplyResponsesUsage(usage, responsesResponse.Usage)
 	// Count actual tool invocations from Output (not tool declarations).
 	for _, output := range responsesResponse.Output {
 		switch output.Type {
@@ -82,10 +86,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 
 	defer service.CloseResponseBodyGracefully(resp)
 
-	var usage = &dto.Usage{}
-	var responseTextBuilder strings.Builder
-	imageCounter := &relaycommon.ImageGenerationCallCounter{}
-	imageCommitted := false
+	accumulator := service.NewResponsesUsageAccumulator(info)
 
 	// 终止事件跟踪：上游流可能在没有 response.completed/failed/incomplete
 	// 的情况下直接 EOF（半死连接、上游崩溃等）。严格客户端（如 Codex）会
@@ -129,11 +130,9 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		// Some upstreams (e.g. Moonshot/Kimi) report reasoning_tokens at the top
 		// level of usage rather than inside output_tokens_details, while strict
 		// clients require the field.
-		sendData := data
 		if streamResponse.Type == "response.completed" || streamResponse.Type == "response.done" {
-			sendData = patchResponsesStreamEventUsage(data)
+			data = patchResponsesStreamEventUsage(data)
 		}
-		sendResponsesStreamData(c, streamResponse, sendData)
 		if isResponsesTerminalEventType(streamResponse.Type) {
 			terminalSeen = true
 		}
@@ -147,88 +146,15 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				}
 			}
 		}
-		switch streamResponse.Type {
-		case "response.completed", "response.done":
-			if streamResponse.Response != nil {
-				if streamResponse.Response.Usage != nil {
-					incomingUsage := relayconvert.NormalizeResponsesUsage(streamResponse.Response.Usage)
-					usage = dto.MergeUsageNonZero(usage, incomingUsage)
-					// Ensure reasoning_tokens is captured from top-level or
-					// output_tokens_details: NormalizeResponsesUsage only reads
-					// completion_tokens_details, so upstreams reporting the value
-					// at the top level (e.g. Moonshot/Kimi) would be under-counted.
-					rt := streamResponse.Response.Usage.ReasoningTokens
-					if rt == 0 && streamResponse.Response.Usage.OutputTokensDetails != nil {
-						rt = streamResponse.Response.Usage.OutputTokensDetails.ReasoningTokens
-					}
-					if rt != 0 {
-						usage.ReasoningTokens = rt
-						usage.CompletionTokenDetails.ReasoningTokens = rt
-					}
-				}
-				if !imageCommitted {
-					if relaycommon.IsNonBillableResponsesStatus(streamResponse.Response.Status) {
-						imageCounter.Reset()
-						imageCounter.Commit(info)
-						imageCommitted = true
-					} else {
-						for i := range streamResponse.Response.Output {
-							idx := i
-							imageCounter.Observe(&streamResponse.Response.Output[i], &idx)
-						}
-						imageCounter.Commit(info)
-						imageCommitted = true
-					}
-				}
-			} else if !imageCommitted {
-				imageCounter.Commit(info)
-				imageCommitted = true
-			}
-		case "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
-			if !imageCommitted {
-				imageCounter.Reset()
-				imageCounter.Commit(info)
-				imageCommitted = true
-			}
-		case "response.output_text.delta":
-			// 处理输出文本
-			responseTextBuilder.WriteString(streamResponse.Delta)
-		case dto.ResponsesOutputTypeItemDone:
-			if streamResponse.Item != nil {
-				switch streamResponse.Item.Type {
-				case dto.BuildInCallWebSearchCall:
-					info.CountBillableToolCall(dto.BuildInCallWebSearchCall, "")
-				case dto.BuildInCallFileSearchCall:
-					info.CountBillableToolCall(dto.BuildInCallFileSearchCall, "")
-				case dto.BuildInCallFunctionCall:
-					info.CountBillableToolCall(dto.BuildInCallFunctionCall, streamResponse.Item.Name)
-				case dto.ResponsesOutputTypeImageGenerationCall:
-					if !imageCommitted {
-						imageCounter.Observe(streamResponse.Item, streamResponse.OutputIndex)
-					}
-				}
-			}
+		if streamResponse.Response != nil {
+			data = string(rewriteSGLangResponsesCreatedAt(info, []byte(data), "response.created_at", streamResponse.Response.CreatedAt))
 		}
+		sendResponsesStreamData(c, streamResponse, data)
+		accumulator.Observe(&streamResponse)
 	})
 
-	if usage.CompletionTokens == 0 {
-		// 计算输出文本的 token 数量
-		tempStr := responseTextBuilder.String()
-		if len(tempStr) > 0 {
-			// 非正常结束，使用输出文本的 token 数量
-			completionTokens := service.CountTextToken(tempStr, info.UpstreamModelName)
-			usage.CompletionTokens = completionTokens
-		}
-	}
-
-	if usage.PromptTokens == 0 && usage.CompletionTokens != 0 {
-		usage.PromptTokens = info.GetEstimatePromptTokens()
-	}
-
-	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
-	if usage.BillingUsage != nil {
-		usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(usage.BillingUsage, usage.CompletionTokens)
-	}
+	common.SetContextKey(c, constant.ContextKeyResponseStreamStatus, info.StreamStatus)
+	info.StreamStatus.RequireTerminal()
 
 	// 上游流结束但未发任何终止事件（半死连接、上游崩溃、超时）：给客户端
 	// 合成终止事件，让严格客户端（如 Codex）干净地失败，而不是无限等待。
@@ -255,7 +181,21 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 
 	helper.Done(c)
 
-	return usage, nil
+	return accumulator.Finish(), nil
+}
+
+func rewriteSGLangResponsesCreatedAt(info *relaycommon.RelayInfo, payload []byte, path string, createdAt dto.IntValue) []byte {
+	if info.GetChannelType() != constant.ChannelTypeSGLang {
+		return payload
+	}
+	if !gjson.GetBytes(payload, path).Exists() {
+		return payload
+	}
+	patched, err := sjson.SetBytes(payload, path, int(createdAt))
+	if err != nil {
+		return payload
+	}
+	return patched
 }
 
 // isResponsesTerminalEventType reports whether a Responses stream event type

@@ -1,6 +1,7 @@
 package oairesponses
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
@@ -20,7 +21,7 @@ func TestResponsesRequestToChatCompletionsRequestInstructionsAndScalarInput(t *t
 	maxOutputTokens := uint(128)
 	parallelToolCalls := true
 
-	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+	got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 		Model:                "gpt-test",
 		Instructions:         mustRawMessage(t, "system rules"),
 		Input:                mustRawMessage(t, "hello"),
@@ -71,7 +72,7 @@ func TestResponsesRequestToChatCompletionsRequestPreservesQwenThinkingBudget(t *
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+			got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 				Model:          "qwen-plus",
 				Input:          mustRawMessage(t, "hello"),
 				EnableThinking: json.RawMessage(`true`),
@@ -92,7 +93,7 @@ func TestResponsesRequestToChatCompletionsRequestPreservesQwenThinkingBudget(t *
 }
 
 func TestResponsesRequestToChatCompletionsRequestMultimodalInput(t *testing.T) {
-	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+	got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 		Model: "gpt-test",
 		Input: mustRawMessage(t, []map[string]any{
 			{
@@ -129,7 +130,7 @@ func TestResponsesRequestToChatCompletionsRequestMultimodalInput(t *testing.T) {
 // 直接透传字符串会被严格上游（iottepa）以 400 Invalid input
 // （param: messages.0.content）拒绝；detail 也必须一并带上而不是丢弃。
 func TestResponsesRequestToChatCompletionsRequestWrapsStringImageURL(t *testing.T) {
-	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+	got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 		Model: "gpt-test",
 		Input: mustRawMessage(t, []map[string]any{
 			{
@@ -155,7 +156,7 @@ func TestResponsesRequestToChatCompletionsRequestWrapsStringImageURL(t *testing.
 }
 
 func TestResponsesRequestToChatCompletionsRequestAssistantTextAndFunctionCallCoexist(t *testing.T) {
-	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+	got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 		Model: "gpt-test",
 		Input: mustRawMessage(t, []map[string]any{
 			{
@@ -194,7 +195,7 @@ func TestResponsesRequestToChatCompletionsRequestAssistantTextAndFunctionCallCoe
 }
 
 func TestResponsesRequestToChatCompletionsRequestOnlyFunctionCallCreatesAssistant(t *testing.T) {
-	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+	got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 		Model: "gpt-test",
 		Input: mustRawMessage(t, []map[string]any{
 			{
@@ -216,7 +217,7 @@ func TestResponsesRequestToChatCompletionsRequestOnlyFunctionCallCreatesAssistan
 }
 
 func TestResponsesRequestToChatCompletionsRequestToolsToolChoiceAndTextFormat(t *testing.T) {
-	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+	got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 		Model: "gpt-test",
 		Input: mustRawMessage(t, "hello"),
 		Tools: mustRawMessage(t, []map[string]any{
@@ -265,7 +266,7 @@ func TestResponsesRequestToChatCompletionsRequestToolsToolChoiceAndTextFormat(t 
 }
 
 func TestResponsesRequestToChatCompletionsRequestCustomToolCallDisguisedAsFunction(t *testing.T) {
-	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+	got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 		Model: "gpt-test",
 		Input: mustRawMessage(t, []map[string]any{
 			{
@@ -302,7 +303,7 @@ func TestResponsesRequestToChatCompletionsRequestCustomToolCallDisguisedAsFuncti
 // freeform 工具声明必须伪装成普通 function：chat 上游只认 function/plugin，
 // 原样透传 type:"custom" 会被上游拒绝（unknown tool type: custom）。
 func TestResponsesRequestToChatCompletionsRequestCustomToolDeclarationDisguised(t *testing.T) {
-	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+	got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 		Model: "gpt-test",
 		Input: mustRawMessage(t, "hi"),
 		Tools: mustRawMessage(t, []map[string]any{
@@ -364,7 +365,7 @@ func TestResponsesRequestToChatCompletionsRequestRejectsStatefulFields(t *testin
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := ResponsesRequestToChatCompletionsRequest(tt.req)
+			_, err := ResponsesRequestToChatCompletionsRequest(context.Background(), tt.req)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.want)
 			assert.Contains(t, err.Error(), "stateful fields")
@@ -403,7 +404,7 @@ func TestResponsesRequestToChatCompletionsRequestPreservesPenalties(t *testing.T
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+			got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 				Model:            "gpt-test",
 				Input:            mustRawMessage(t, "hello"),
 				FrequencyPenalty: tt.frequencyRaw,
@@ -418,7 +419,7 @@ func TestResponsesRequestToChatCompletionsRequestPreservesPenalties(t *testing.T
 }
 
 func TestResponsesRequestToChatCompletionsRequestRejectsMalformedPenalty(t *testing.T) {
-	_, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+	_, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 		Model:            "gpt-test",
 		Input:            mustRawMessage(t, "hello"),
 		FrequencyPenalty: json.RawMessage(`"not-a-number"`),
@@ -437,7 +438,7 @@ func mustRawMessage(t *testing.T, value any) []byte {
 // Codex 的 namespace 工具信封（collaboration/MCP 等）必须展平成内部工具；
 // input 里的 additional_tools 项要提取为工具且不产生消息。
 func TestResponsesRequestToChatCompletionsRequestNamespaceAndAdditionalTools(t *testing.T) {
-	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+	got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 		Model: "gpt-test",
 		Input: mustRawMessage(t, []map[string]any{
 			{"role": "user", "content": "hi"},
@@ -517,7 +518,7 @@ func TestResponsesRequestToChatCompletionsRequestDropsUnsupportedToolTypes(t *te
 			{"type": "function", "name": "exec", "parameters": map[string]any{"type": "object"}},
 		}),
 	}
-	got, err := ResponsesRequestToChatCompletionsRequest(req)
+	got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), req)
 	require.NoError(t, err)
 	require.Len(t, got.Tools, 2)
 
@@ -545,7 +546,7 @@ func TestResponsesRequestToChatCompletionsRequestRestoresCallsFromHistory(t *tes
 		}},
 	})
 
-	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+	got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 		Model:              "gpt-test",
 		PreviousResponseID: "resp_prev",
 		Input: mustRawMessage(t, []map[string]any{
@@ -580,7 +581,7 @@ func TestResponsesRequestToChatCompletionsRequestHistoryNoDoubleRestore(t *testi
 		}},
 	})
 
-	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+	got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 		Model:              "gpt-test",
 		PreviousResponseID: "resp_prev2",
 		Input: mustRawMessage(t, []map[string]any{
@@ -604,7 +605,7 @@ func TestResponsesRequestToChatCompletionsRequestHistoryNoDoubleRestore(t *testi
 
 // assistant 的 tool_calls 缺 reasoning_content 时补占位（部分严格上游要求）。
 func TestResponsesRequestToChatCompletionsRequestBackfillsReasoningPlaceholder(t *testing.T) {
-	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+	got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 		Model: "gpt-test",
 		Input: mustRawMessage(t, []map[string]any{
 			{
@@ -624,7 +625,7 @@ func TestResponsesRequestToChatCompletionsRequestBackfillsReasoningPlaceholder(t
 // tool_search_call / tool_search_output 输入项映射为 function(tool_search)
 // 调用与 tool 消息。
 func TestResponsesRequestToChatCompletionsRequestToolSearchInputItems(t *testing.T) {
-	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+	got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 		Model: "gpt-test",
 		Input: mustRawMessage(t, []map[string]any{
 			{
@@ -656,7 +657,7 @@ func TestResponsesRequestToChatCompletionsRequestToolSearchInputItems(t *testing
 // chat 上游无 developer 角色（Kimi 等 400 "role developer is not allowed"），
 // 必须映射为 system。
 func TestResponsesRequestToChatCompletionsRequestMapsDeveloperRoleToSystem(t *testing.T) {
-	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+	got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 		Model: "gpt-test",
 		Input: mustRawMessage(t, []map[string]any{
 			{

@@ -56,7 +56,7 @@ func ChatCompletionsResponseToResponsesResponseWithCustomTools(resp *dto.OpenAIT
 	out := &dto.OpenAIResponsesResponse{
 		ID:        id,
 		Object:    "response",
-		CreatedAt: chatCreatedAt(resp.Created),
+		CreatedAt: dto.IntValue(chatCreatedAt(resp.Created)),
 		Status:    []byte(`"completed"`),
 		Model:     resp.Model,
 		Output:    make([]dto.ResponsesOutput, 0),
