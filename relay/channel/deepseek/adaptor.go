@@ -169,7 +169,67 @@ func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rela
 
 func (a *Adaptor) ConvertOpenAIResponsesRequest(_ *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
 	applyDeepSeekV4ResponsesThinkingSuffix(info, &request)
+	applyResponsesReasoningText(&request)
 	return request, nil
+}
+
+// applyResponsesReasoningText fills content[].reasoning_text from summary[].summary_text for
+// reasoning items that carry no reasoning text. DeepSeek official rejects a history whose
+// reasoning items lack reasoning_text, while summary-only providers (Command Code) produce
+// exactly that shape, so the missing text is mirrored before the request goes upstream.
+func applyResponsesReasoningText(request *dto.OpenAIResponsesRequest) {
+	if len(request.Input) == 0 {
+		return
+	}
+	var items []map[string]any
+	if err := common.Unmarshal(request.Input, &items); err != nil {
+		return
+	}
+	changed := false
+	for _, item := range items {
+		if item["type"] != "reasoning" {
+			continue
+		}
+		if parts, ok := item["content"].([]any); ok {
+			hasText := false
+			for _, part := range parts {
+				if p, ok := part.(map[string]any); ok && p["type"] == "reasoning_text" {
+					hasText = true
+					break
+				}
+			}
+			if hasText {
+				continue
+			}
+		}
+		summaries, ok := item["summary"].([]any)
+		if !ok {
+			continue
+		}
+		filled := make([]any, 0, len(summaries))
+		for _, part := range summaries {
+			p, ok := part.(map[string]any)
+			if !ok || p["type"] != "summary_text" {
+				continue
+			}
+			text, ok := p["text"].(string)
+			if !ok || text == "" {
+				continue
+			}
+			filled = append(filled, map[string]any{"type": "reasoning_text", "text": text})
+		}
+		if len(filled) == 0 {
+			continue
+		}
+		item["content"] = filled
+		changed = true
+	}
+	if !changed {
+		return
+	}
+	if data, err := common.Marshal(items); err == nil {
+		request.Input = data
+	}
 }
 
 func applyDeepSeekV4ResponsesThinkingSuffix(info *relaycommon.RelayInfo, request *dto.OpenAIResponsesRequest) {
