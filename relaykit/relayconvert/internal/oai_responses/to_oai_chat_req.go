@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -24,7 +25,7 @@ const (
 )
 
 // toolSearchProxyName 是 tool_search 在 chat 侧合成的 function 名
-//（对齐 CC Switch 的 TOOL_SEARCH_PROXY_NAME）。
+// （对齐 CC Switch 的 TOOL_SEARCH_PROXY_NAME）。
 const toolSearchProxyName = "tool_search"
 
 const (
@@ -228,12 +229,25 @@ func responsesRequestMessagesToChat(req *dto.OpenAIResponsesRequest) ([]dto.Mess
 		if err := kitutil.Unmarshal(req.Input, &items); err != nil {
 			return nil, fmt.Errorf("invalid input array: %w", err)
 		}
+		// Chat Completions requires the tool messages answering one assistant tool_calls
+		// batch to stay contiguous, so media hoisted out of function_call_output items is
+		// held back and emitted as a single user message once the batch ends.
+		var pendingMedia []any
 		for _, item := range items {
-			nextMessages, err := responsesInputItemToChatMessages(item, messages)
+			itemType := strings.TrimSpace(kitutil.Interface2String(item["type"]))
+			if len(pendingMedia) > 0 && itemType != responsesInputTypeFunctionCallOutput {
+				messages = append(messages, dto.Message{Role: "user", Content: pendingMedia})
+				pendingMedia = nil
+			}
+			nextMessages, media, err := responsesInputItemToChatMessages(item, messages)
 			if err != nil {
 				return nil, err
 			}
 			messages = nextMessages
+			pendingMedia = append(pendingMedia, media...)
+		}
+		if len(pendingMedia) > 0 {
+			messages = append(messages, dto.Message{Role: "user", Content: pendingMedia})
 		}
 		return messages, nil
 	default:
@@ -241,43 +255,46 @@ func responsesRequestMessagesToChat(req *dto.OpenAIResponsesRequest) ([]dto.Mess
 	}
 }
 
-func responsesInputItemToChatMessages(item map[string]any, messages []dto.Message) ([]dto.Message, error) {
+// responsesInputItemToChatMessages appends the Chat messages for one Responses input item.
+// The second result carries media content parts hoisted out of a function_call_output item,
+// already in Chat shape; the caller decides where that user message lands.
+func responsesInputItemToChatMessages(item map[string]any, messages []dto.Message) ([]dto.Message, []any, error) {
 	itemType := strings.TrimSpace(kitutil.Interface2String(item["type"]))
 	switch itemType {
 	case responsesInputTypeFunctionCall:
 		toolCall, err := responsesFunctionCallItemToChatToolCall(item)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return appendToolCallToLastAssistant(messages, toolCall), nil
+		return appendToolCallToLastAssistant(messages, toolCall), nil, nil
 	case responsesInputTypeCustomToolCall:
 		toolCall, err := responsesCustomToolCallItemToChatToolCall(item)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return appendToolCallToLastAssistant(messages, toolCall), nil
+		return appendToolCallToLastAssistant(messages, toolCall), nil, nil
 	case responsesInputTypeToolSearchCall:
 		toolCall, err := responsesToolSearchCallItemToChatToolCall(item)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return appendToolCallToLastAssistant(messages, toolCall), nil
+		return appendToolCallToLastAssistant(messages, toolCall), nil, nil
 	case responsesInputTypeFunctionCallOutput, responsesInputTypeCustomToolOutput, responsesInputTypeToolSearchOutput:
 		callID := strings.TrimSpace(kitutil.Interface2String(item["call_id"]))
-		content := responseToolOutputToChatContent(item["output"])
-		return append(messages, dto.Message{Role: "tool", ToolCallId: callID, Content: content}), nil
+		content, media := responsesToolOutputToChat(item["output"])
+		return append(messages, dto.Message{Role: "tool", ToolCallId: callID, Content: content}), media, nil
 	}
 
 	role := strings.TrimSpace(kitutil.Interface2String(item["role"]))
 	if itemType == "additional_tools" {
 		// 工具清单/工具搜索结果项，不是消息：其中的 tools 已在
 		// ResponsesRequestToChatCompletionsRequest 里单独提取转换。
-		return messages, nil
+		return messages, nil, nil
 	}
 	if itemType == "reasoning" {
 		// reasoning 项对 chat 上游无意义（encrypted_content 无法解密），
 		// 直接跳过，避免退化成空 user 消息。
-		return messages, nil
+		return messages, nil, nil
 	}
 	if role == "" {
 		role = "user"
@@ -289,9 +306,9 @@ func responsesInputItemToChatMessages(item map[string]any, messages []dto.Messag
 	}
 	content, err := responsesInputContentToChatContent(item["content"])
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return append(messages, dto.Message{Role: role, Content: content}), nil
+	return append(messages, dto.Message{Role: role, Content: content}), nil, nil
 }
 
 func responsesInputContentToChatContent(content any) (any, error) {
@@ -412,7 +429,8 @@ func responsesToolSearchCallItemToChatToolCall(item map[string]any) (dto.ToolCal
 	}, nil
 }
 
-func responsesCustomToolCallItemToChatToolCall(item map[string]any) (dto.ToolCallRequest, error) {	name := strings.TrimSpace(kitutil.Interface2String(item["name"]))
+func responsesCustomToolCallItemToChatToolCall(item map[string]any) (dto.ToolCallRequest, error) {
+	name := strings.TrimSpace(kitutil.Interface2String(item["name"]))
 	if name == "" {
 		return dto.ToolCallRequest{}, errors.New("custom_tool_call item is missing name")
 	}
@@ -932,6 +950,57 @@ func responsesArgumentsString(value any) string {
 		}
 		return string(raw)
 	}
+}
+
+// responsesToolOutputToChat maps a function_call_output payload onto Chat Completions, where a
+// tool message may only carry text. A Responses content-part array keeps its text on the tool
+// message and returns the media parts in Chat shape for the caller to hoist into a user message;
+// stringifying them instead would hand base64 image data to the upstream text tokenizer. Any
+// other payload shape (string, object, plain JSON array) keeps the historical stringified form.
+func responsesToolOutputToChat(value any) (any, []any) {
+	rawParts, ok := value.([]any)
+	if !ok || len(rawParts) == 0 {
+		return responseToolOutputToChatContent(value), nil
+	}
+
+	texts := make([]string, 0, len(rawParts))
+	mediaParts := make([]any, 0, len(rawParts))
+	labels := make([]string, 0, len(rawParts))
+	for _, rawPart := range rawParts {
+		part, ok := rawPart.(map[string]any)
+		if !ok {
+			return responseToolOutputToChatContent(value), nil
+		}
+		partType := strings.TrimSpace(kitutil.Interface2String(part["type"]))
+		switch partType {
+		case "input_text", "output_text", "text":
+			if text := kitutil.Interface2String(part["text"]); text != "" {
+				texts = append(texts, text)
+			}
+		case "input_image", "input_file", "input_audio", "input_video":
+			mediaParts = append(mediaParts, part)
+			label := "[" + strings.TrimPrefix(partType, "input_") + "]"
+			if !slices.Contains(labels, label) {
+				labels = append(labels, label)
+			}
+		default:
+			return responseToolOutputToChatContent(value), nil
+		}
+	}
+	if len(mediaParts) == 0 {
+		return strings.Join(texts, "\n"), nil
+	}
+
+	converted, err := responsesContentPartsToChatContent(mediaParts)
+	if err != nil {
+		return responseToolOutputToChatContent(value), nil
+	}
+	media, _ := converted.([]any)
+	if len(texts) == 0 {
+		// Upstreams reject empty tool content; the media itself rides on the hoisted user message.
+		return strings.Join(labels, " "), media
+	}
+	return strings.Join(texts, "\n"), media
 }
 
 func responseToolOutputToChatContent(value any) any {
