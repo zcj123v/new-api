@@ -269,7 +269,7 @@ func TestRelayRejectsOverLimitChatRequestWithoutBilling(t *testing.T) {
 	assert.Contains(t, payload.Message, "This model's maximum context length is 1000 tokens")
 	assert.Contains(t, payload.Message, "Please reduce the length of your input.")
 	assert.Zero(t, fixture.upstreamCalls.Load(), "a rejected request must not reach the upstream")
-	assert.Len(t, fixture.useChannels, 1, "a rejected request must not be retried on another channel")
+	assert.Empty(t, fixture.useChannels, "a rejected request is stopped before the attempt loop, so no channel is tried or retried")
 	assert.Equal(t, quotaBefore, fixture.userQuota(t), "a rejected request must not change user quota")
 	assert.Equal(t, remainBefore, fixture.tokenRemainQuota(t), "a rejected request must not pre-consume token quota")
 	assert.Equal(t, logsBefore, fixture.consumeLogCount(t), "a rejected request must not write a consume log")
