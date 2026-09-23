@@ -130,6 +130,13 @@ func newInputLimitFixture(t *testing.T, channels []inputLimitChannel) *inputLimi
 	t.Helper()
 	user, token := setupResponsesWSRequestTest(t)
 	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	// The option map is process state built at startup; UpdateOption writes
+	// through it, so the fixture must initialize it like the real server does.
+	model.InitOptionMap()
+	common.OptionMapRWMutex.RLock()
+	_, optionRegistered := common.OptionMap[setting.ModelMaxInputTokensOptionKey]
+	common.OptionMapRWMutex.RUnlock()
+	require.True(t, optionRegistered, "ModelMaxInputTokens must be a registered global option")
 
 	previousRatios := ratio_setting.ModelRatio2JSONString()
 	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(
