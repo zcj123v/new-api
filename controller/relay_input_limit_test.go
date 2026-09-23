@@ -129,7 +129,11 @@ type inputLimitFixture struct {
 func newInputLimitFixture(t *testing.T, channels []inputLimitChannel) *inputLimitFixture {
 	t.Helper()
 	user, token := setupResponsesWSRequestTest(t)
-	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	// InitDB skips migrations for non-master nodes, so the fixture migrates the
+	// tables this flow touches: options (option writes), user_subscriptions and
+	// logs (pre-consume and consume-log assertions), channels/abilities (routing).
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Option{}, &model.UserSubscription{}))
+	require.NoError(t, model.LOG_DB.AutoMigrate(&model.Log{}))
 	// The option map is process state built at startup; UpdateOption writes
 	// through it, so the fixture must initialize it like the real server does.
 	model.InitOptionMap()
