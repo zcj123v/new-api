@@ -64,6 +64,10 @@ const (
 	ErrorCodeReadRequestBodyFailed ErrorCode = "read_request_body_failed"
 	ErrorCodeConvertRequestFailed  ErrorCode = "convert_request_failed"
 	ErrorCodeAccessDenied          ErrorCode = "access_denied"
+	// ErrorCodeContextLengthExceeded reports a request whose input exceeds the
+	// configured per-model limit. Clients recognize the OpenAI-compatible code
+	// and message, so they can enter their own context-overflow recovery path.
+	ErrorCodeContextLengthExceeded ErrorCode = "context_length_exceeded"
 
 	// request error
 	ErrorCodeBadRequestBody ErrorCode = "bad_request_body"

@@ -32,6 +32,10 @@ type ChannelSettings struct {
 	// HTTP2ConnectionShards spreads HTTP/2 traffic across N independent transports
 	// (1-8). Zero/unset means 1. Ignored when HTTPProtocol is "http1".
 	HTTP2ConnectionShards int `json:"http2_connection_shards,omitempty"`
+	// MaxInputTokens overrides the global ModelMaxInputTokens limit for this
+	// channel: a positive value caps the accepted input tokens, -1 disables the
+	// limit, and 0/unset inherits the model-level value.
+	MaxInputTokens int `json:"max_input_tokens,omitempty"`
 }
 
 // BindsTaskPlugin reports whether the channel is bound to the task plugin,
