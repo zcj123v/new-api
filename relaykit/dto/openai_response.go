@@ -241,6 +241,12 @@ type Usage struct {
 	InputTokensDetails     *InputTokenDetails  `json:"input_tokens_details"`
 	OutputTokensDetails    *OutputTokenDetails `json:"output_tokens_details,omitempty"`
 
+	// ReasoningTokens is populated when the upstream reports reasoning tokens at
+	// the top level of the usage object (e.g. Moonshot/Kimi) rather than inside
+	// completion_tokens_details. It is used to ensure output_tokens_details is
+	// always populated in Responses API responses. (fork deviation)
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+
 	// claude cache 1h
 	ClaudeCacheCreation5mTokens int `json:"claude_cache_creation_5_m_tokens"`
 	ClaudeCacheCreation1hTokens int `json:"claude_cache_creation_1_h_tokens"`
