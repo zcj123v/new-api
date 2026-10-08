@@ -1,6 +1,7 @@
 package oaichat
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -375,7 +376,9 @@ func TestChatCompletionsResponseToResponsesMapsCustomToolCall(t *testing.T) {
 	assert.Equal(t, responsesOutputTypeCustomToolCall, resp.Output[0].Type)
 	assert.Equal(t, "call_1", resp.Output[0].CallId)
 	assert.Equal(t, "apply_patch", resp.Output[0].Name)
-	assert.Equal(t, "*** Begin Patch", resp.Output[0].Input)
+	inputText := ""
+	require.NoError(t, json.Unmarshal(resp.Output[0].Input, &inputText))
+	assert.Equal(t, "*** Begin Patch", inputText)
 	assert.Empty(t, resp.Output[0].Arguments)
 
 	// 不在 customTools 里的同名调用保持 function_call（nil map 也安全）
@@ -444,15 +447,19 @@ func TestChatCompletionsStreamToResponsesEventsCustomToolCall(t *testing.T) {
 	assert.Equal(t, responsesOutputTypeCustomToolCall, added.Payload.Item.Type)
 	assert.Equal(t, "apply_patch", added.Payload.Item.Name)
 	require.NotNil(t, inputDone)
-	assert.Equal(t, "*** Begin Patch", inputDone.Payload.Input)
+	assert.Equal(t, "*** Begin Patch", *inputDone.Payload.Input)
 	require.NotNil(t, itemDone)
 	assert.Equal(t, responsesOutputTypeCustomToolCall, itemDone.Payload.Item.Type)
-	assert.Equal(t, "*** Begin Patch", itemDone.Payload.Item.Input)
+	itemDoneInput := ""
+	require.NoError(t, json.Unmarshal(itemDone.Payload.Item.Input, &itemDoneInput))
+	assert.Equal(t, "*** Begin Patch", itemDoneInput)
 	require.NotNil(t, completed)
 	require.NotNil(t, completed.Payload.Response)
 	require.Len(t, completed.Payload.Response.Output, 1)
 	assert.Equal(t, responsesOutputTypeCustomToolCall, completed.Payload.Response.Output[0].Type)
-	assert.Equal(t, "*** Begin Patch", completed.Payload.Response.Output[0].Input)
+	completedInput := ""
+	require.NoError(t, json.Unmarshal(completed.Payload.Response.Output[0].Input, &completedInput))
+	assert.Equal(t, "*** Begin Patch", completedInput)
 }
 
 // 流式方向：tool_search 还原为 tool_search_call（execution: client），
@@ -750,13 +757,12 @@ func TestChatCompletionsStreamToResponsesHoldsNamelessToolUntilNameArrives(t *te
 		for _, event := range done {
 			types = append(types, event.Type)
 		}
-		assert.Equal(t, []string{
-			responsesEventOutputItemAdded,
-			responsesEventFunctionArgsDelta,
-			responsesEventFunctionArgsDone,
-			responsesEventOutputItemDone,
-			responsesEventCompleted,
-		}, types)
+		// fork deviation：到 done 仍无名的调用被丢弃，回合转 failed，
+		// 防 Codex agent loop 拿到空 output 静默终止。
+		assert.Equal(t, []string{responsesEventFailed}, types)
+		require.NotEmpty(t, done)
+		require.NotNil(t, done[0].Payload.Response)
+		assert.Equal(t, []byte(`"failed"`), done[0].Payload.Response.Status)
 	})
 }
 

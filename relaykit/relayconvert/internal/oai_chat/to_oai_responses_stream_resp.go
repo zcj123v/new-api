@@ -396,7 +396,7 @@ func FinalizeChatCompletionsStreamToResponses(state *ChatToResponsesStreamState)
 	switch {
 	case state.status == "incomplete":
 		eventType = responsesEventIncomplete
-	case state.droppedToolCalls > 0 && len(state.toolsByIndex) == 0:
+	case state.droppedToolCalls > 0 && len(state.toolsByIndex) == state.droppedToolCalls:
 		// 上游给出 tool_calls 但所有调用名皆为空：与非流式一致转 failed，
 		// 防 Codex agent loop 拿到空 output 静默终止。
 		eventType = responsesEventFailed
@@ -534,17 +534,10 @@ func (s *ChatToResponsesStreamState) appendToolCallDelta(toolCall dto.ToolCallRe
 	tool := s.toolsByIndex[chatIndex]
 	events := make([]ChatToResponsesStreamEvent, 0, 2)
 	if tool == nil {
-		toolName := strings.TrimSpace(toolCall.Function.Name)
-		if toolName == "" {
-			// 丢弃无名 tool call 并计数；若回合最终一个可用调用都不剩，
-			// finalize 时统一转 failed（防 Codex agent loop 静默终止）。
-			s.droppedToolCalls++
-			return events, nil
-		}
 		tool = &chatToResponsesStreamTool{
 			ChatIndex: chatIndex,
 			CallID:    incomingID,
-			Name:      toolName,
+			Name:      strings.TrimSpace(toolCall.Function.Name),
 		}
 		tool.ItemID = incomingID
 		if tool.ItemID == "" {
@@ -688,6 +681,13 @@ func (s *ChatToResponsesStreamState) doneDeltaEvents() []ChatToResponsesStreamEv
 	}
 	for _, tool := range s.sortedTools() {
 		if tool.Done {
+			continue
+		}
+		if !tool.Announced && strings.TrimSpace(tool.Name) == "" {
+			// fork：到 done 仍无名的 tool call 丢弃并计数；若回合一个可用
+			// 调用都不剩，finalize 统一转 failed（防 Codex agent loop 静默终止）。
+			tool.Done = true
+			s.droppedToolCalls++
 			continue
 		}
 		tool.Done = true
