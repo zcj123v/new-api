@@ -150,7 +150,14 @@ func ChatCompletionsResponseToResponsesResponse(resp *dto.OpenAITextResponse, id
 }
 
 func ChatCompletionsResponseToResponsesResponseWithCustomTools(resp *dto.OpenAITextResponse, id string, customTools map[string]bool, toolSearchEnabled bool) (*dto.OpenAIResponsesResponse, *dto.Usage, error) {
-	return oaichat.ChatCompletionsResponseToResponsesResponseWithCustomTools(resp, id, customTools, toolSearchEnabled)
+	state := &convmeta.ResponsesToolState{ToolSearchEnabled: toolSearchEnabled}
+	for name := range customTools {
+		if state.CustomToolNames == nil {
+			state.CustomToolNames = make(map[string]struct{}, len(customTools))
+		}
+		state.CustomToolNames[name] = struct{}{}
+	}
+	return oaichat.ChatCompletionsResponseToResponsesResponseWithTools(resp, id, state)
 }
 
 func ResponsesStatusFromChatFinishReason(finishReason string) (string, *dto.IncompleteDetails) {

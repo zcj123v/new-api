@@ -947,7 +947,7 @@ func newOAIChatToOAIResponsesStreamState(options ResponseStreamOptions) any {
 	return state
 }
 
-func convertOAIChatStreamResponseToOAIResponses(_ context.Context, info convmeta.Meta, response any, state any) ([]any, *dto.Usage, error) {
+func convertOAIChatStreamResponseToOAIResponses(c context.Context, info convmeta.Meta, response any, state any) ([]any, *dto.Usage, error) {
 	chatResponse, err := asOAIChatStreamResponse(response)
 	if err != nil {
 		return nil, nil, err
