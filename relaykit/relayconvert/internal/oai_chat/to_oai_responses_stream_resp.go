@@ -563,9 +563,10 @@ func (s *ChatToResponsesStreamState) appendToolCallDelta(toolCall dto.ToolCallRe
 	}
 	delta := toolCall.Function.Arguments
 	tool.Arguments.WriteString(delta)
-	// Whether a call restores a custom tool depends on its name, so a nameless
-	// first fragment is held back while custom tools are in play.
-	if !tool.Announced && (tool.Name != "" || !s.hasCustomTools()) {
+	// A nameless first fragment is always held back on this fork: its tool
+	// kind (custom vs function) is unknowable without a name, and a call that
+	// stays nameless until completion is dropped and fails the round.
+	if !tool.Announced && tool.Name != "" {
 		events = append(events, s.announceTool(tool))
 		delta = tool.Arguments.String()
 	}
