@@ -762,7 +762,7 @@ func TestChatCompletionsStreamToResponsesHoldsNamelessToolUntilNameArrives(t *te
 		assert.Equal(t, []string{responsesEventFailed}, types)
 		require.NotEmpty(t, done)
 		require.NotNil(t, done[0].Payload.Response)
-		assert.Equal(t, []byte(`"failed"`), done[0].Payload.Response.Status)
+		assert.Equal(t, `"failed"`, string(done[0].Payload.Response.Status))
 	})
 }
 
