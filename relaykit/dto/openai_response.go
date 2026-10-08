@@ -241,12 +241,6 @@ type Usage struct {
 	InputTokensDetails     *InputTokenDetails  `json:"input_tokens_details"`
 	OutputTokensDetails    *OutputTokenDetails `json:"output_tokens_details,omitempty"`
 
-	// ReasoningTokens is populated when the upstream reports reasoning tokens at
-	// the top level of the usage object (e.g. Moonshot/Kimi) rather than inside
-	// completion_tokens_details. It is used to ensure output_tokens_details is
-	// always populated in Responses API responses.
-	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
-
 	// claude cache 1h
 	ClaudeCacheCreation5mTokens int `json:"claude_cache_creation_5_m_tokens"`
 	ClaudeCacheCreation1hTokens int `json:"claude_cache_creation_1_h_tokens"`
@@ -381,10 +375,9 @@ type ResponsesOutput struct {
 	CallId              string                          `json:"call_id,omitempty"`
 	Name                string                          `json:"name,omitempty"`
 	Arguments           json.RawMessage                 `json:"arguments,omitempty"`
-	// Input 承载 custom_tool_call 的 freeform 输入（Codex apply_patch 等）。
-	Input string `json:"input,omitempty"`
+	Input               json.RawMessage                 `json:"input,omitempty"`
 	// Execution 标记 tool_search_call 由客户端执行（"client"）。
-	Execution string `json:"execution,omitempty"`
+	Execution           string                          `json:"execution,omitempty"`
 	Action              json.RawMessage                 `json:"action,omitempty"`
 	Queries             json.RawMessage                 `json:"queries,omitempty"`
 	Results             json.RawMessage                 `json:"results,omitempty"`
@@ -403,9 +396,23 @@ type ResponsesOutput struct {
 
 // MarshalJSON keeps hosted-tool variants within their protocol-specific
 // schemas. ResponsesOutput also represents messages, images, and function
-// calls, whose fields must not leak into web_search_call or mcp_call items.
+// calls, whose fields must not leak into web_search_call, mcp_call, or
+// custom_tool_call items.
 func (r ResponsesOutput) MarshalJSON() ([]byte, error) {
 	switch r.Type {
+	case "custom_tool_call":
+		input := r.Input
+		if len(input) == 0 {
+			input = json.RawMessage(`""`)
+		}
+		return kitutil.Marshal(struct {
+			Type   string          `json:"type"`
+			ID     string          `json:"id,omitempty"`
+			Status string          `json:"status,omitempty"`
+			CallID string          `json:"call_id"`
+			Name   string          `json:"name"`
+			Input  json.RawMessage `json:"input"`
+		}{Type: r.Type, ID: r.ID, Status: r.Status, CallID: r.CallId, Name: r.Name, Input: input})
 	case "web_search_call":
 		return kitutil.Marshal(struct {
 			Type   string          `json:"type"`
@@ -565,6 +572,7 @@ type ResponsesStreamResponse struct {
 	Param           string                   `json:"param,omitempty"`
 	Delta           string                   `json:"delta,omitempty"`
 	Arguments       *string                  `json:"arguments,omitempty"`
+	Input           *string                  `json:"input,omitempty"`
 	Name            string                   `json:"name,omitempty"`
 	Text            *string                  `json:"text,omitempty"`
 	Item            *ResponsesOutput         `json:"item,omitempty"`
@@ -574,13 +582,13 @@ type ResponsesStreamResponse struct {
 	Obfuscation     string                   `json:"obfuscation,omitempty"`
 	// - response.function_call_arguments.delta
 	// - response.function_call_arguments.done
+	// - response.custom_tool_call_input.delta
+	// - response.custom_tool_call_input.done
 	OutputIndex  *int                           `json:"output_index,omitempty"`
 	ContentIndex *int                           `json:"content_index,omitempty"`
 	SummaryIndex *int                           `json:"summary_index,omitempty"`
 	ItemID       string                         `json:"item_id,omitempty"`
 	Part         *ResponsesReasoningSummaryPart `json:"part,omitempty"`
-	// Input 承载 response.custom_tool_call_input.done 的完整 freeform 输入。
-	Input string `json:"input,omitempty"`
 }
 
 // GetOpenAIError 从动态错误类型中提取OpenAIError结构

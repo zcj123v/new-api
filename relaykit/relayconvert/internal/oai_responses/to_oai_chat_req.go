@@ -62,7 +62,7 @@ func ResponsesRequestToChatCompletionsRequest(ctx context.Context, req *dto.Open
 		return nil, err
 	}
 
-	tools, err := responsesRequestToolsToChat(workReq.Tools)
+	tools, err := responsesRequestToolsToChat(workReq.Tools, true)
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +70,7 @@ func ResponsesRequestToChatCompletionsRequest(ctx context.Context, req *dto.Open
 	// tool_search_output 项（客户端工具搜索的结果）里也有工具定义，
 	// 而不是顶层 tools。提取出来一并转换，消息流里跳过这些项。
 	if extraRaw := responsesInputEmbeddedToolsRaw(workReq.Input); len(extraRaw) > 0 {
-		extraTools, err := responsesRequestToolsToChat(extraRaw)
+		extraTools, err := responsesRequestToolsToChat(extraRaw, false)
 		if err != nil {
 			return nil, err
 		}
@@ -459,7 +459,7 @@ func appendToolCallToLastAssistant(messages []dto.Message, toolCall dto.ToolCall
 	return messages
 }
 
-func responsesRequestToolsToChat(raw json.RawMessage) ([]dto.ToolCallRequest, error) {
+func responsesRequestToolsToChat(raw json.RawMessage, topLevel bool) ([]dto.ToolCallRequest, error) {
 	if !rawJSONPresent(raw) {
 		return nil, nil
 	}
@@ -513,8 +513,13 @@ func responsesRequestToolsToChat(raw json.RawMessage) ([]dto.ToolCallRequest, er
 		}
 
 		if toolType == dto.CustomType {
-			// freeform 工具（如 Codex 的 apply_patch）：chat 上游只认 function，
-			// 伪装成 {"input": "..."} 单参数函数；响应方向按工具名还原。
+			if topLevel {
+				// 顶层 freeform 工具交给 registry 层 toolconv.AttachRequest 统一
+				// 转换并记录 ResponsesToolState；这里跳过以免双重写入。
+				continue
+			}
+			// 嵌套（namespace 展平 / additional_tools，不在 AttachRequest 的
+			// 工具集里）：伪装成 {"input": "..."} 单参数函数，响应方向按名还原。
 			name := strings.TrimSpace(kitutil.Interface2String(tool["name"]))
 			if name == "" {
 				continue
@@ -560,7 +565,7 @@ func responsesRequestToolsToChat(raw json.RawMessage) ([]dto.ToolCallRequest, er
 			if err != nil {
 				return nil, err
 			}
-			nested, err := responsesRequestToolsToChat(nestedRaw)
+			nested, err := responsesRequestToolsToChat(nestedRaw, false)
 			if err != nil {
 				return nil, err
 			}

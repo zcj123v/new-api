@@ -300,9 +300,11 @@ func TestResponsesRequestToChatCompletionsRequestCustomToolCallDisguisedAsFuncti
 	assert.Equal(t, "patch applied", got.Messages[1].StringContent())
 }
 
-// freeform 工具声明必须伪装成普通 function：chat 上游只认 function/plugin，
-// 原样透传 type:"custom" 会被上游拒绝（unknown tool type: custom）。
-func TestResponsesRequestToChatCompletionsRequestCustomToolDeclarationDisguised(t *testing.T) {
+// 顶层 freeform 工具声明由 registry 层 toolconv.AttachRequest 统一伪装成
+// function 并记录 ResponsesToolState；转换器自身必须跳过，避免双重写入。
+// （嵌套 namespace / additional_tools 里的 custom 仍由本包伪装，见
+// TestResponsesRequestToChatCompletionsRequestNamespaceAndAdditionalTools。）
+func TestResponsesRequestToChatCompletionsRequestSkipsTopLevelCustomToolDeclaration(t *testing.T) {
 	got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 		Model: "gpt-test",
 		Input: mustRawMessage(t, "hi"),
@@ -317,21 +319,8 @@ func TestResponsesRequestToChatCompletionsRequestCustomToolDeclarationDisguised(
 		}),
 	})
 	require.NoError(t, err)
-	require.Len(t, got.Tools, 2)
-
-	custom := got.Tools[0]
-	assert.Equal(t, "function", custom.Type, "custom tool must be disguised as function")
-	assert.Equal(t, "apply_patch", custom.Function.Name)
-	assert.Contains(t, custom.Function.Description, "Apply a patch")
-	assert.Contains(t, custom.Function.Description, "patch grammar")
-	params, ok := custom.Function.Parameters.(map[string]any)
-	require.True(t, ok)
-	assert.Contains(t, params["required"], "input")
-	props, ok := params["properties"].(map[string]any)
-	require.True(t, ok)
-	require.Contains(t, props, "input")
-
-	assert.Equal(t, "exec", got.Tools[1].Function.Name)
+	require.Len(t, got.Tools, 1)
+	assert.Equal(t, "exec", got.Tools[0].Function.Name)
 
 	names := CollectResponsesCustomToolNames(mustRawMessage(t, []map[string]any{
 		{"type": "custom", "name": "apply_patch"},

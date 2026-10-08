@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 )
 
@@ -22,16 +23,12 @@ type ChatToResponsesStreamState struct {
 	Created int64
 	Usage   *dto.Usage
 
-	// CustomTools 记录请求侧被伪装成 function 的 freeform 工具名；
-	// 命中名字的 tool call 还原为 custom_tool_call 事件序列。
-	CustomTools map[string]bool
-	// ToolSearchEnabled 标记请求侧声明了 tool_search（被合成为同名
-	// function），其调用还原为 tool_search_call（execution: client）。
-	ToolSearchEnabled bool
-
 	// EmitSequenceNumber enables the required sequence_number field for current
 	// Responses API SSE consumers while preserving the legacy relaykit default.
 	EmitSequenceNumber bool
+	// Tools marks the Chat function calls that encode Responses custom tools;
+	// they are streamed back as custom_tool_call items.
+	Tools *convmeta.ResponsesToolState
 
 	status             string
 	incompleteDetails  *dto.IncompleteDetails
@@ -47,7 +44,6 @@ type ChatToResponsesStreamState struct {
 	nextOutputIndex    int
 	toolsByIndex       map[int]*chatToResponsesStreamTool
 	hostedByID         map[string]*chatToResponsesHostedTool
-	droppedToolCalls   int
 	outputOrder        []chatToResponsesOutputRef
 	text               strings.Builder
 	annotations        []any
@@ -62,15 +58,19 @@ type ChatToResponsesStreamState struct {
 }
 
 type chatToResponsesStreamTool struct {
-	ChatIndex    int
-	OutputIndex  int
-	ItemID       string
-	CallID       string
-	Name         string
-	IsCustom     bool
-	IsToolSearch bool
-	Arguments    strings.Builder
-	Done         bool
+	ChatIndex   int
+	OutputIndex int
+	ItemID      string
+	CallID      string
+	Name        string
+	Arguments   strings.Builder
+	// Announced records that output_item.added was sent. Custom reports that
+	// the call restores a Responses custom tool; ToolSearch reports the
+	// synthesized tool_search function; both are fixed at announcement.
+	Announced   bool
+	Custom      bool
+	ToolSearch  bool
+	Done        bool
 }
 
 type chatToResponsesOutputRef struct {
@@ -390,24 +390,13 @@ func FinalizeChatCompletionsStreamToResponses(state *ChatToResponsesStreamState)
 	state.finalized = true
 	resp := state.finalResponse()
 	eventType := responsesEventCompleted
-	switch {
-	case state.status == "incomplete":
+	if state.status == "incomplete" {
 		eventType = responsesEventIncomplete
-	case state.droppedToolCalls > 0 && len(state.toolsByIndex) == 0:
-		// 上游给出 tool_calls 但所有调用名皆为空：与非流式一致转 failed，
-		// 防 Codex agent loop 拿到空 output 静默终止。
-		eventType = responsesEventFailed
-		resp.Status = []byte(`"failed"`)
-		resp.Error = map[string]any{
-			"code":    "upstream_tool_call_dropped",
-			"message": "upstream returned tool calls but every tool call had an empty name",
-		}
 	}
 	events = append(events, state.event(eventType, dto.ResponsesStreamResponse{
 		Type:     eventType,
 		Response: resp,
 	}))
-	recordResponsesToolCallHistory(resp)
 	return events
 }
 
@@ -531,72 +520,16 @@ func (s *ChatToResponsesStreamState) appendToolCallDelta(toolCall dto.ToolCallRe
 	tool := s.toolsByIndex[chatIndex]
 	events := make([]ChatToResponsesStreamEvent, 0, 2)
 	if tool == nil {
-		toolName := strings.TrimSpace(toolCall.Function.Name)
-		if toolName == "" {
-			// 丢弃无名 tool call 并计数；若回合最终一个可用调用都不剩，
-			// finalize 时统一转 failed（防 Codex agent loop 静默终止）。
-			s.droppedToolCalls++
-			return events, nil
-		}
 		tool = &chatToResponsesStreamTool{
-			ChatIndex:   chatIndex,
-			OutputIndex: s.nextIndex(chatToResponsesOutputRef{Kind: "tool", ToolIndex: chatIndex}),
-			CallID:      incomingID,
-			Name:        strings.TrimSpace(toolCall.Function.Name),
+			ChatIndex: chatIndex,
+			CallID:    incomingID,
+			Name:      strings.TrimSpace(toolCall.Function.Name),
 		}
 		tool.ItemID = incomingID
 		if tool.ItemID == "" {
 			tool.ItemID = fmt.Sprintf("%s_call_%d", s.ID, chatIndex)
 		}
 		s.toolsByIndex[chatIndex] = tool
-		tool.IsCustom = s.CustomTools[tool.Name]
-		tool.IsToolSearch = s.ToolSearchEnabled && tool.Name == "tool_search"
-		switch {
-		case tool.IsToolSearch:
-			// tool_search：arguments 流暂存，完成时一次性发出。
-			events = append(events, s.event(responsesEventOutputItemAdded, dto.ResponsesStreamResponse{
-				Type:        responsesEventOutputItemAdded,
-				OutputIndex: intPtr(tool.OutputIndex),
-				ItemID:      tool.ItemID,
-				Item: &dto.ResponsesOutput{
-					Type:      responsesOutputTypeToolSearchCall,
-					ID:        tool.ItemID,
-					Status:    "in_progress",
-					CallId:    tool.callID(),
-					Execution: "client",
-				},
-			}))
-		case tool.IsCustom:
-			// freeform 工具：item 类型为 custom_tool_call；arguments 流暂存，
-			// 完成时解包 {"input": "..."} 一次性发出，不做半成品 JSON 解包。
-			events = append(events, s.event(responsesEventOutputItemAdded, dto.ResponsesStreamResponse{
-				Type:        responsesEventOutputItemAdded,
-				OutputIndex: intPtr(tool.OutputIndex),
-				ItemID:      tool.ItemID,
-				Item: &dto.ResponsesOutput{
-					Type:   responsesOutputTypeCustomToolCall,
-					ID:     tool.ItemID,
-					Status: "in_progress",
-					CallId: tool.callID(),
-					Name:   tool.Name,
-					Input:  "",
-				},
-			}))
-		default:
-			events = append(events, s.event(responsesEventOutputItemAdded, dto.ResponsesStreamResponse{
-				Type:        responsesEventOutputItemAdded,
-				OutputIndex: intPtr(tool.OutputIndex),
-				ItemID:      tool.ItemID,
-				Item: &dto.ResponsesOutput{
-					Type:      responsesOutputTypeFunctionCall,
-					ID:        tool.ItemID,
-					Status:    "in_progress",
-					CallId:    tool.callID(),
-					Name:      tool.Name,
-					Arguments: []byte(`""`),
-				},
-			}))
-		}
 	}
 	if tool.Done {
 		return nil, fmt.Errorf("tool-call stream index %d received data after completion", chatIndex)
@@ -613,21 +546,65 @@ func (s *ChatToResponsesStreamState) appendToolCallDelta(toolCall dto.ToolCallRe
 			return nil, fmt.Errorf("tool-call stream index %d changed name from %q to %q", chatIndex, tool.Name, incomingName)
 		}
 		tool.Name = incomingName
-		tool.IsCustom = s.CustomTools[tool.Name]
-		tool.IsToolSearch = s.ToolSearchEnabled && tool.Name == "tool_search"
 	}
-	if toolCall.Function.Arguments != "" {
-		tool.Arguments.WriteString(toolCall.Function.Arguments)
-		if !tool.IsCustom && !tool.IsToolSearch {
-			events = append(events, s.event(responsesEventFunctionArgsDelta, dto.ResponsesStreamResponse{
-				Type:        responsesEventFunctionArgsDelta,
-				OutputIndex: intPtr(tool.OutputIndex),
-				ItemID:      tool.ItemID,
-				Delta:       toolCall.Function.Arguments,
-			}))
-		}
+	delta := toolCall.Function.Arguments
+	tool.Arguments.WriteString(delta)
+	// Whether a call restores a custom tool depends on its name, so a nameless
+	// first fragment is held back while custom tools are in play.
+	if !tool.Announced && (tool.Name != "" || !s.hasCustomTools()) {
+		events = append(events, s.announceTool(tool))
+		delta = tool.Arguments.String()
+	}
+	// Custom tool input and tool_search arguments are sent in full at the end.
+	if tool.Announced && !tool.Custom && !tool.ToolSearch && delta != "" {
+		events = append(events, s.event(responsesEventFunctionArgsDelta, dto.ResponsesStreamResponse{
+			Type:        responsesEventFunctionArgsDelta,
+			OutputIndex: intPtr(tool.OutputIndex),
+			ItemID:      tool.ItemID,
+			Delta:       delta,
+		}))
 	}
 	return events, nil
+}
+
+func (s *ChatToResponsesStreamState) hasCustomTools() bool {
+	return s.Tools != nil && len(s.Tools.CustomToolNames) > 0
+}
+
+// announceTool also allocates the output index, so a held tool never ends up
+// behind items that were added to the stream before it.
+func (s *ChatToResponsesStreamState) announceTool(tool *chatToResponsesStreamTool) ChatToResponsesStreamEvent {
+	tool.Announced = true
+	tool.OutputIndex = s.nextIndex(chatToResponsesOutputRef{Kind: "tool", ToolIndex: tool.ChatIndex})
+	tool.Custom = s.Tools.IsCustomTool(tool.Name)
+	tool.ToolSearch = s.Tools != nil && s.Tools.ToolSearchEnabled && tool.Name == "tool_search"
+	item := &dto.ResponsesOutput{
+		Type:      responsesOutputTypeFunctionCall,
+		ID:        tool.ItemID,
+		Status:    "in_progress",
+		CallId:    tool.callID(),
+		Name:      tool.Name,
+		Arguments: []byte(`""`),
+	}
+	if tool.Custom {
+		item.Type = responsesOutputTypeCustomToolCall
+		item.Arguments = nil
+		item.Input = []byte(`""`)
+	}
+	if tool.ToolSearch {
+		// tool_search：arguments 流暂存，完成时以对象形式随 output_item.done 发出；
+		// execution: client 由 Codex 本地执行。
+		item.Type = responsesOutputTypeToolSearchCall
+		item.Name = ""
+		item.Arguments = nil
+		item.Execution = "client"
+	}
+	return s.event(responsesEventOutputItemAdded, dto.ResponsesStreamResponse{
+		Type:        responsesEventOutputItemAdded,
+		OutputIndex: intPtr(tool.OutputIndex),
+		ItemID:      tool.ItemID,
+		Item:        item,
+	})
 }
 
 func (s *ChatToResponsesStreamState) doneDeltaEvents() []ChatToResponsesStreamEvent {
@@ -693,18 +670,36 @@ func (s *ChatToResponsesStreamState) doneDeltaEvents() []ChatToResponsesStreamEv
 			continue
 		}
 		tool.Done = true
-		switch {
-		case tool.IsToolSearch:
+		if !tool.Announced {
+			events = append(events, s.announceTool(tool))
+			if !tool.Custom && !tool.ToolSearch && tool.Arguments.Len() > 0 {
+				events = append(events, s.event(responsesEventFunctionArgsDelta, dto.ResponsesStreamResponse{
+					Type:        responsesEventFunctionArgsDelta,
+					OutputIndex: intPtr(tool.OutputIndex),
+					ItemID:      tool.ItemID,
+					Delta:       tool.Arguments.String(),
+				}))
+			}
+		}
+		if tool.ToolSearch {
 			// tool_search_call 无参数增量事件，output_item.done 携带完整 arguments。
-		case tool.IsCustom:
-			customInputDone := dto.ResponsesStreamResponse{
+		} else if tool.Custom {
+			input := customToolInputFromArguments(tool.Arguments.String())
+			if input != "" {
+				events = append(events, s.event(responsesEventCustomToolInputDelta, dto.ResponsesStreamResponse{
+					Type:        responsesEventCustomToolInputDelta,
+					OutputIndex: intPtr(tool.OutputIndex),
+					ItemID:      tool.ItemID,
+					Delta:       input,
+				}))
+			}
+			events = append(events, s.event(responsesEventCustomToolInputDone, dto.ResponsesStreamResponse{
 				Type:        responsesEventCustomToolInputDone,
 				OutputIndex: intPtr(tool.OutputIndex),
 				ItemID:      tool.ItemID,
-				Input:       kitutil.UnwrapCustomToolInput(tool.Arguments.String()),
-			}
-			events = append(events, s.event(responsesEventCustomToolInputDone, customInputDone))
-		default:
+				Input:       kitutil.GetPointer(input),
+			}))
+		} else {
 			argumentsDone := dto.ResponsesStreamResponse{
 				Type:        responsesEventFunctionArgsDone,
 				OutputIndex: intPtr(tool.OutputIndex),
@@ -896,7 +891,7 @@ func (s *ChatToResponsesStreamState) reasoningOutput(status string) *dto.Respons
 }
 
 func (s *ChatToResponsesStreamState) toolOutput(tool *chatToResponsesStreamTool, status string) *dto.ResponsesOutput {
-	if tool.IsToolSearch {
+	if tool.ToolSearch {
 		return &dto.ResponsesOutput{
 			Type:      responsesOutputTypeToolSearchCall,
 			ID:        tool.ItemID,
@@ -906,14 +901,14 @@ func (s *ChatToResponsesStreamState) toolOutput(tool *chatToResponsesStreamTool,
 			Arguments: chatArgumentsObjectRawMessage(tool.Arguments.String()),
 		}
 	}
-	if tool.IsCustom {
+	if tool.Custom {
 		return &dto.ResponsesOutput{
 			Type:   responsesOutputTypeCustomToolCall,
 			ID:     tool.ItemID,
 			Status: status,
 			CallId: tool.callID(),
 			Name:   tool.Name,
-			Input:  kitutil.UnwrapCustomToolInput(tool.Arguments.String()),
+			Input:  chatArgumentsRawMessage(customToolInputFromArguments(tool.Arguments.String())),
 		}
 	}
 	return &dto.ResponsesOutput{

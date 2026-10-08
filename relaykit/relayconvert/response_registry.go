@@ -893,7 +893,7 @@ func usageFromClaudeResponse(resp *dto.ClaudeResponse) *dto.Usage {
 	return nil
 }
 
-func convertOAIChatResponseToOAIResponses(c context.Context, _ convmeta.Meta, response any) (any, *dto.Usage, error) {
+func convertOAIChatResponseToOAIResponses(c context.Context, info convmeta.Meta, response any) (any, *dto.Usage, error) {
 	chatResponse, err := asOAIChatResponse(response)
 	if err != nil {
 		return nil, nil, err
@@ -902,7 +902,16 @@ func convertOAIChatResponseToOAIResponses(c context.Context, _ convmeta.Meta, re
 	if id == "" {
 		id = fmt.Sprintf("resp_%s", kitutil.GetUUID())
 	}
-	return ChatCompletionsResponseToResponsesResponseWithCustomTools(chatResponse, id, responsesCustomToolNamesFromContext(c), responsesToolSearchEnabledFromContext(c))
+	// tool_search 标志走 fork 的 context 通道（上游 state 无此概念），
+	// 与上游记录的 custom 工具名合并后交给转换器。
+	tools := convmeta.ResponsesToolStateOf(info)
+	if responsesToolSearchEnabledFromContext(c) {
+		if tools == nil {
+			tools = &convmeta.ResponsesToolState{}
+		}
+		tools.ToolSearchEnabled = true
+	}
+	return oaichat.ChatCompletionsResponseToResponsesResponseWithTools(chatResponse, id, tools)
 }
 
 func convertOAIResponsesResponseToOAIChat(_ context.Context, _ convmeta.Meta, response any) (any, *dto.Usage, error) {
@@ -938,7 +947,7 @@ func newOAIChatToOAIResponsesStreamState(options ResponseStreamOptions) any {
 	return state
 }
 
-func convertOAIChatStreamResponseToOAIResponses(c context.Context, _ convmeta.Meta, response any, state any) ([]any, *dto.Usage, error) {
+func convertOAIChatStreamResponseToOAIResponses(_ context.Context, info convmeta.Meta, response any, state any) ([]any, *dto.Usage, error) {
 	chatResponse, err := asOAIChatStreamResponse(response)
 	if err != nil {
 		return nil, nil, err
@@ -947,10 +956,16 @@ func convertOAIChatStreamResponseToOAIResponses(c context.Context, _ convmeta.Me
 	if !ok || streamState == nil {
 		return nil, nil, errors.New("OAI chat to OAI responses stream state is required")
 	}
-	if streamState.CustomTools == nil {
-		streamState.CustomTools = responsesCustomToolNamesFromContext(c)
+	if streamState.Tools == nil {
+		streamState.Tools = convmeta.ResponsesToolStateOf(info)
+		// tool_search 标志走 fork 的 context 通道（上游 state 无此概念）。
+		if responsesToolSearchEnabledFromContext(c) {
+			if streamState.Tools == nil {
+				streamState.Tools = &convmeta.ResponsesToolState{}
+			}
+			streamState.Tools.ToolSearchEnabled = true
+		}
 	}
-	streamState.ToolSearchEnabled = responsesToolSearchEnabledFromContext(c)
 	events, err := ChatCompletionsStreamChunkToResponsesEvents(chatResponse, streamState)
 	if err != nil {
 		return nil, nil, err

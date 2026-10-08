@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/codexhistory"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 )
 
@@ -19,13 +20,13 @@ const (
 	responsesEventCreated                   = "response.created"
 	responsesEventCompleted                 = "response.completed"
 	responsesEventIncomplete                = "response.incomplete"
-	responsesEventFailed                    = "response.failed"
 	responsesEventOutputTextDelta           = "response.output_text.delta"
 	responsesEventOutputTextAnnotationAdded = "response.output_text.annotation.added"
 	responsesEventOutputItemAdded           = "response.output_item.added"
 	responsesEventOutputItemDone            = "response.output_item.done"
 	responsesEventFunctionArgsDelta         = "response.function_call_arguments.delta"
 	responsesEventFunctionArgsDone          = "response.function_call_arguments.done"
+	responsesEventCustomToolInputDelta      = "response.custom_tool_call_input.delta"
 	responsesEventCustomToolInputDone       = "response.custom_tool_call_input.done"
 	responsesEventReasoningSummaryPartAdded = "response.reasoning_summary_part.added"
 	responsesEventReasoningSummaryDelta     = "response.reasoning_summary_text.delta"
@@ -41,15 +42,12 @@ const (
 )
 
 func ChatCompletionsResponseToResponsesResponse(resp *dto.OpenAITextResponse, id string) (*dto.OpenAIResponsesResponse, *dto.Usage, error) {
-	return ChatCompletionsResponseToResponsesResponseWithCustomTools(resp, id, nil, false)
+	return ChatCompletionsResponseToResponsesResponseWithTools(resp, id, nil)
 }
 
-// ChatCompletionsResponseToResponsesResponseWithCustomTools converts a chat
-// response to Responses format, mapping function calls whose names are in
-// customTools back to custom_tool_call items (unwrapping {"input": "..."}).
-// toolSearchEnabled additionally maps calls to the synthesized tool_search
-// function back to tool_search_call items (execution: client).
-func ChatCompletionsResponseToResponsesResponseWithCustomTools(resp *dto.OpenAITextResponse, id string, customTools map[string]bool, toolSearchEnabled bool) (*dto.OpenAIResponsesResponse, *dto.Usage, error) {
+// ChatCompletionsResponseToResponsesResponseWithTools also restores function
+// calls that tools marks as Responses custom tools into custom_tool_call items.
+func ChatCompletionsResponseToResponsesResponseWithTools(resp *dto.OpenAITextResponse, id string, tools *convmeta.ResponsesToolState) (*dto.OpenAIResponsesResponse, *dto.Usage, error) {
 	if resp == nil {
 		return nil, nil, errors.New("response is nil")
 	}
@@ -116,7 +114,7 @@ func ChatCompletionsResponseToResponsesResponseWithCustomTools(resp *dto.OpenAIT
 			droppedToolCalls++
 			continue
 		}
-		toolOutput, err := chatToolCallToResponsesOutput(toolCall, id, i, responseOutputStatus(out), customTools, toolSearchEnabled)
+		toolOutput, err := chatToolCallToResponsesOutput(toolCall, id, i, responseOutputStatus(out), tools)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -263,25 +261,6 @@ func UsageFromChatUsage(src *dto.Usage) *dto.Usage {
 		src.CompletionTokenDetails.ImageTokens != 0 {
 		usage.CompletionTokenDetails = src.CompletionTokenDetails
 	}
-
-	// Ensure reasoning_tokens is captured from both sources:
-	// 1. Top-level reasoning_tokens (e.g. Moonshot/Kimi upstream)
-	// 2. completion_tokens_details.reasoning_tokens (standard OpenAI)
-	reasoningTokens := src.ReasoningTokens
-	if reasoningTokens == 0 {
-		reasoningTokens = src.CompletionTokenDetails.ReasoningTokens
-	}
-	usage.ReasoningTokens = reasoningTokens
-	// output_tokens_details is always emitted (reasoning_tokens may be 0) to
-	// match upstream OpenAI behavior; strict Responses clients require the field.
-	if src.OutputTokensDetails != nil {
-		usage.OutputTokensDetails = src.OutputTokensDetails
-	} else {
-		usage.OutputTokensDetails = &dto.OutputTokenDetails{
-			ReasoningTokens: reasoningTokens,
-		}
-	}
-
 	usage.ClaudeCacheCreation5mTokens = src.ClaudeCacheCreation5mTokens
 	usage.ClaudeCacheCreation1hTokens = src.ClaudeCacheCreation1hTokens
 	return usage
@@ -303,14 +282,14 @@ func responseStatusString(resp *dto.OpenAIResponsesResponse) string {
 	return strings.TrimSpace(status)
 }
 
-func chatToolCallToResponsesOutput(toolCall dto.ToolCallRequest, responseID string, index int, status string, customTools map[string]bool, toolSearchEnabled bool) (dto.ResponsesOutput, error) {
+func chatToolCallToResponsesOutput(toolCall dto.ToolCallRequest, responseID string, index int, status string, tools *convmeta.ResponsesToolState) (dto.ResponsesOutput, error) {
 	callID := strings.TrimSpace(toolCall.ID)
 	if callID == "" {
 		callID = fmt.Sprintf("%s_call_%d", responseID, index)
 	}
 	if toolCall.Type == "" || toolCall.Type == "function" {
 		name := toolCall.Function.Name
-		if toolSearchEnabled && name == "tool_search" {
+		if tools != nil && tools.ToolSearchEnabled && name == "tool_search" {
 			// 合成的 tool_search function 被调用：还原为 tool_search_call，
 			// arguments 以对象形式携带，execution: client 由 Codex 本地执行。
 			return dto.ResponsesOutput{
@@ -322,16 +301,14 @@ func chatToolCallToResponsesOutput(toolCall dto.ToolCallRequest, responseID stri
 				Arguments: chatArgumentsObjectRawMessage(toolCall.Function.Arguments),
 			}, nil
 		}
-		if customTools[name] {
-			// 伪装成 function 的 freeform 工具：还原为 custom_tool_call，
-			// arguments {"input": "..."} 解包回 input 字符串。
+		if tools.IsCustomTool(name) {
 			return dto.ResponsesOutput{
-				Type:   "custom_tool_call",
+				Type:   responsesOutputTypeCustomToolCall,
 				ID:     callID,
 				Status: status,
 				CallId: callID,
-				Name:   name,
-				Input:  kitutil.UnwrapCustomToolInput(toolCall.Function.Arguments),
+				Name:   toolCall.Function.Name,
+				Input:  chatArgumentsRawMessage(customToolInputFromArguments(toolCall.Function.Arguments)),
 			}, nil
 		}
 		return dto.ResponsesOutput{
@@ -339,7 +316,7 @@ func chatToolCallToResponsesOutput(toolCall dto.ToolCallRequest, responseID stri
 			ID:        callID,
 			Status:    status,
 			CallId:    callID,
-			Name:      name,
+			Name:      toolCall.Function.Name,
 			Arguments: chatArgumentsRawMessage(toolCall.Function.Arguments),
 		}, nil
 	}
@@ -350,6 +327,28 @@ func chatToolCallToResponsesOutput(toolCall dto.ToolCallRequest, responseID stri
 		CallId:    callID,
 		Arguments: toolCall.Custom,
 	}, nil
+}
+
+// customToolInputFromArguments unwraps the raw custom tool input from the
+// {"input": ...} arguments a Chat function call carries. Arguments of any other
+// shape are returned unchanged so the model's output is never dropped.
+func customToolInputFromArguments(arguments string) string {
+	var value map[string]any
+	if err := kitutil.UnmarshalJsonStr(arguments, &value); err != nil {
+		return arguments
+	}
+	input, ok := value[convmeta.CustomToolInputArgument]
+	if !ok {
+		return arguments
+	}
+	if text, ok := input.(string); ok {
+		return text
+	}
+	raw, err := kitutil.Marshal(input)
+	if err != nil {
+		return arguments
+	}
+	return string(raw)
 }
 
 func chatArgumentsRawMessage(arguments string) []byte {
