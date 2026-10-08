@@ -262,6 +262,25 @@ func UsageFromChatUsage(src *dto.Usage) *dto.Usage {
 		src.CompletionTokenDetails.ImageTokens != 0 {
 		usage.CompletionTokenDetails = src.CompletionTokenDetails
 	}
+
+	// Ensure reasoning_tokens is captured from both sources:
+	// 1. Top-level reasoning_tokens (e.g. Moonshot/Kimi upstream)
+	// 2. completion_tokens_details.reasoning_tokens (standard OpenAI)
+	reasoningTokens := src.ReasoningTokens
+	if reasoningTokens == 0 {
+		reasoningTokens = src.CompletionTokenDetails.ReasoningTokens
+	}
+	usage.ReasoningTokens = reasoningTokens
+	// output_tokens_details is always emitted (reasoning_tokens may be 0) to
+	// match upstream OpenAI behavior; strict Responses clients require the field.
+	if src.OutputTokensDetails != nil {
+		usage.OutputTokensDetails = src.OutputTokensDetails
+	} else {
+		usage.OutputTokensDetails = &dto.OutputTokenDetails{
+			ReasoningTokens: reasoningTokens,
+		}
+	}
+
 	usage.ClaudeCacheCreation5mTokens = src.ClaudeCacheCreation5mTokens
 	usage.ClaudeCacheCreation1hTokens = src.ClaudeCacheCreation1hTokens
 	return usage

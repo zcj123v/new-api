@@ -29,6 +29,9 @@ type ChatToResponsesStreamState struct {
 	// Tools marks the Chat function calls that encode Responses custom tools;
 	// they are streamed back as custom_tool_call items.
 	Tools *convmeta.ResponsesToolState
+	// droppedToolCalls counts nameless tool-call fragments dropped on
+	// this fork; finalize turns a fully-dropped tool_calls round into failed.
+	droppedToolCalls   int
 
 	status             string
 	incompleteDetails  *dto.IncompleteDetails
@@ -390,13 +393,24 @@ func FinalizeChatCompletionsStreamToResponses(state *ChatToResponsesStreamState)
 	state.finalized = true
 	resp := state.finalResponse()
 	eventType := responsesEventCompleted
-	if state.status == "incomplete" {
+	switch {
+	case state.status == "incomplete":
 		eventType = responsesEventIncomplete
+	case state.droppedToolCalls > 0 && len(state.toolsByIndex) == 0:
+		// 上游给出 tool_calls 但所有调用名皆为空：与非流式一致转 failed，
+		// 防 Codex agent loop 拿到空 output 静默终止。
+		eventType = responsesEventFailed
+		resp.Status = []byte(`"failed"`)
+		resp.Error = map[string]any{
+			"code":    "upstream_tool_call_dropped",
+			"message": "upstream returned tool calls but every tool call had an empty name",
+		}
 	}
 	events = append(events, state.event(eventType, dto.ResponsesStreamResponse{
 		Type:     eventType,
 		Response: resp,
 	}))
+	recordResponsesToolCallHistory(resp)
 	return events
 }
 
@@ -520,10 +534,17 @@ func (s *ChatToResponsesStreamState) appendToolCallDelta(toolCall dto.ToolCallRe
 	tool := s.toolsByIndex[chatIndex]
 	events := make([]ChatToResponsesStreamEvent, 0, 2)
 	if tool == nil {
+		toolName := strings.TrimSpace(toolCall.Function.Name)
+		if toolName == "" {
+			// 丢弃无名 tool call 并计数；若回合最终一个可用调用都不剩，
+			// finalize 时统一转 failed（防 Codex agent loop 静默终止）。
+			s.droppedToolCalls++
+			return events, nil
+		}
 		tool = &chatToResponsesStreamTool{
 			ChatIndex: chatIndex,
 			CallID:    incomingID,
-			Name:      strings.TrimSpace(toolCall.Function.Name),
+			Name:      toolName,
 		}
 		tool.ItemID = incomingID
 		if tool.ItemID == "" {
