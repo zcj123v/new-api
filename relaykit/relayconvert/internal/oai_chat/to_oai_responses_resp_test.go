@@ -837,11 +837,22 @@ func TestChatCompletionsStreamToResponsesHoldsNamelessToolUntilNameArrives(t *te
 			assert.Equal(t, "lookup", output[0].Name)
 		}
 		// fork deviation：到 done 仍无名的调用被丢弃，回合转 failed，
-		// 防 Codex agent loop 拿到空 output 静默终止。
-		assert.Equal(t, []string{responsesEventFailed}, types)
-		require.NotEmpty(t, done)
-		require.NotNil(t, done[0].Payload.Response)
-		assert.Equal(t, `"failed"`, string(done[0].Payload.Response.Status))
+		// 防 Codex agent loop 拿到空 output 静默终止。（独立场景，区别于
+		// 上面上游版"无名被丢、有效保留"的多 call 场景。）
+		for _, tools := range []*convmeta.ResponsesToolState{nil, execCustomToolState()} {
+			state := NewChatToResponsesStreamState("resp_1", "gpt-test")
+			state.Tools = tools
+			mustResponsesEventsFromChatChunk(t, state, chunk(dto.ToolCallResponse{Index: &toolIndex, ID: "call_x", Function: dto.FunctionResponse{Arguments: `{}`}}))
+			done := FinalizeChatCompletionsStreamToResponses(state)
+			types := make([]string, 0, len(done))
+			for _, event := range done {
+				types = append(types, event.Type)
+			}
+			assert.Equal(t, []string{responsesEventFailed}, types)
+			require.NotEmpty(t, done)
+			require.NotNil(t, done[0].Payload.Response)
+			assert.Equal(t, `"failed"`, string(done[0].Payload.Response.Status))
+		}
 	})
 }
 
