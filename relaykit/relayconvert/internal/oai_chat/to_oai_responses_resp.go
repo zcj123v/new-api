@@ -109,9 +109,9 @@ func ChatCompletionsResponseToResponsesResponseWithTools(resp *dto.OpenAITextRes
 
 	droppedToolCalls := 0
 	for i, toolCall := range choice.Message.ParseToolCalls() {
-		// 丢弃无名/纯空白名的 tool call（上游偶发）；若本应 completed 的
-		// tool_calls 回合一个可用调用都不剩，下方统一转 failed。
-		if strings.TrimSpace(toolCall.Function.Name) == "" {
+		// 丢弃无名/纯空白名的 tool call（上游偶发，仅 function 类，类型限定随上游 rc.42）；
+		// 若本应 completed 的 tool_calls 回合一个可用调用都不剩，下方统一转 failed。(fork)
+		if (toolCall.Type == "" || toolCall.Type == "function") && strings.TrimSpace(toolCall.Function.Name) == "" {
 			droppedToolCalls++
 			continue
 		}
@@ -308,10 +308,10 @@ func chatToolCallToResponsesOutput(toolCall dto.ToolCallRequest, responseID stri
 		callID = fmt.Sprintf("%s_call_%d", responseID, index)
 	}
 	if toolCall.Type == "" || toolCall.Type == "function" {
-		name := toolCall.Function.Name
-		if tools != nil && tools.ToolSearchEnabled && name == "tool_search" {
+		namespace, name := tools.ResponsesToolName(toolCall.Function.Name)
+		if tools != nil && tools.ToolSearchEnabled && toolCall.Function.Name == "tool_search" {
 			// 合成的 tool_search function 被调用：还原为 tool_search_call，
-			// arguments 以对象形式携带，execution: client 由 Codex 本地执行。
+			// arguments 以对象形式携带，execution: client 由 Codex 本地执行。(fork)
 			return dto.ResponsesOutput{
 				Type:      responsesOutputTypeToolSearchCall,
 				ID:        callID,
@@ -321,14 +321,15 @@ func chatToolCallToResponsesOutput(toolCall dto.ToolCallRequest, responseID stri
 				Arguments: chatArgumentsObjectRawMessage(toolCall.Function.Arguments),
 			}, nil
 		}
-		if tools.IsCustomTool(name) {
+		if tools.IsCustomTool(toolCall.Function.Name) {
 			return dto.ResponsesOutput{
-				Type:   responsesOutputTypeCustomToolCall,
-				ID:     callID,
-				Status: status,
-				CallId: callID,
-				Name:   toolCall.Function.Name,
-				Input:  chatArgumentsRawMessage(customToolInputFromArguments(toolCall.Function.Arguments)),
+				Type:      responsesOutputTypeCustomToolCall,
+				ID:        callID,
+				Status:    status,
+				CallId:    callID,
+				Name:      name,
+				Namespace: namespace,
+				Input:     chatArgumentsRawMessage(customToolInputFromArguments(toolCall.Function.Arguments)),
 			}, nil
 		}
 		return dto.ResponsesOutput{
@@ -336,7 +337,8 @@ func chatToolCallToResponsesOutput(toolCall dto.ToolCallRequest, responseID stri
 			ID:        callID,
 			Status:    status,
 			CallId:    callID,
-			Name:      toolCall.Function.Name,
+			Name:      name,
+			Namespace: namespace,
 			Arguments: chatArgumentsRawMessage(toolCall.Function.Arguments),
 		}, nil
 	}
