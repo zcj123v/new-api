@@ -78,7 +78,7 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 
 func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	if resp == nil || resp.Body == nil {
-		logger.LogError(c, "invalid response or response body")
+		logger.LogError(c, common.LogText("invalid response or response body"))
 		return nil, types.NewError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse)
 	}
 
@@ -103,8 +103,9 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		var streamResponse dto.ResponsesStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
 			// 解析失败时原样透传而不是丢事件（例如 created_at 为浮点的上游），
-			// 仅无法做 usage 记账与补丁。
-			logger.LogError(c, "failed to unmarshal stream response, relay raw data: "+err.Error())
+			// 仅无法做 usage 记账与补丁；不记 sr 软错误，避免良性透传被
+			// StreamStatus 归入 HasErrors 污染 stream_status 口径。
+			logger.LogError(c, common.LogText("failed to unmarshal stream response, relay raw data: %s", err.Error()))
 			if doc := parseResponsesStreamEventDoc(data); doc != nil {
 				if t, _ := doc["type"].(string); isResponsesTerminalEventType(t) {
 					terminalSeen = true

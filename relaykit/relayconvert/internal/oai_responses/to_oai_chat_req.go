@@ -873,20 +873,22 @@ func RequestTextToChatResponseFormat(raw json.RawMessage) (*dto.ResponseFormat, 
 // image_url。Responses 规范里 image_url 是字符串（URL 或 data URL），而 chat 规范
 // 要求对象 {"url": ...}；直接把字符串透传出去会被严格上游（如 iottepa）以
 // 400 Invalid input（param: messages.0.content）拒绝。此函数与
-// normalizeChatImageURLToString 互为镜像。已是对象的输入原样保留，detail 一并带上。
+// normalizeChatImageURLToString 互为镜像。已是对象的输入原样保留。detail 只透传
+// chat 标准值（low/high/auto）：上游 rc44（#7578）指出用旧 OpenAI SDK 校验的 chat
+// 上游会拒绝 "original" 等 Responses 侧新值，非标准值直接丢弃。
 func responsesImagePartToChatImageURL(part map[string]any) any {
 	if imageURL, ok := part["image_url"]; ok {
 		switch v := imageURL.(type) {
 		case map[string]any:
 			return v
 		case dto.MessageImageUrl:
-			return chatImageURLObject(v.Url, v.Detail)
+			return chatImageURLObject(v.Url, chatSafeImageDetail(v.Detail))
 		case *dto.MessageImageUrl:
 			if v != nil {
-				return chatImageURLObject(v.Url, v.Detail)
+				return chatImageURLObject(v.Url, chatSafeImageDetail(v.Detail))
 			}
 		}
-		return chatImageURLObject(kitutil.Interface2String(imageURL), kitutil.Interface2String(part["detail"]))
+		return chatImageURLObject(kitutil.Interface2String(imageURL), chatSafeImageDetail(kitutil.Interface2String(part["detail"])))
 	}
 	imageURL := map[string]any{}
 	for _, key := range []string{"url", "file_id", "detail"} {
@@ -898,6 +900,16 @@ func responsesImagePartToChatImageURL(part map[string]any) any {
 		return part
 	}
 	return imageURL
+}
+
+// chatSafeImageDetail 仅放行 chat 侧 detail 的标准枚举值，其余（含 Responses 侧
+// "original"）返回空串，由 chatImageURLObject 省略该字段。
+func chatSafeImageDetail(detail string) string {
+	switch detail {
+	case "low", "high", "auto":
+		return detail
+	}
+	return ""
 }
 
 func chatImageURLObject(url string, detail string) map[string]any {

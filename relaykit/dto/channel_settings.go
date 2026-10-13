@@ -36,6 +36,9 @@ type ChannelSettings struct {
 	// channel: a positive value caps the accepted input tokens, -1 disables the
 	// limit, and 0/unset inherits the model-level value.
 	MaxInputTokens int `json:"max_input_tokens,omitempty"`
+	// TLSInsecureSkipVerify accepts upstream certificates that fail
+	// verification, such as self-signed ones, for this channel only.
+	TLSInsecureSkipVerify bool `json:"tls_insecure_skip_verify,omitempty"`
 }
 
 // BindsTaskPlugin reports whether the channel is bound to the task plugin,
