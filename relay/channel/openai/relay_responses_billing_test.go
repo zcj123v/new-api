@@ -161,8 +161,12 @@ func TestOaiResponsesStreamHandlerCompletionLifecycle(t *testing.T) {
 			t.Cleanup(func() { require.NoError(t, body.Close()) })
 			ctx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
+			needle := payload + "\n\n"
+			if tc.responseStatus != "" {
+				needle = fmt.Sprintf(`"type":%q`, tc.event)
+			}
 			writer := &responsesLifecycleWriter{
-				ResponseRecorder: httptest.NewRecorder(), body: body, needle: payload + "\n\n",
+				ResponseRecorder: httptest.NewRecorder(), body: body, needle: needle,
 				cancelBeforeFlush: tc.cancelBeforeFlush, waitForCleanup: tc.cancel || tc.scannerError,
 				failWrite: tc.failWrite, writeErr: errors.New("downstream write failed"),
 			}
@@ -203,27 +207,31 @@ func TestOaiResponsesStreamHandlerCompletionLifecycle(t *testing.T) {
 				assert.Equal(t, 1, info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolImageGeneration].CallCount)
 			}
 			if tc.failWrite == 0 {
-				var want map[string]any
-				require.NoError(t, common.UnmarshalJsonStr(payload, &want))
-				found := false
-				for _, line := range strings.Split(writer.Body.String(), "\n") {
-					if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
-						continue
+				if tc.responseStatus == "" {
+					assert.Contains(t, writer.Body.String(), payload+"\n\n")
+				} else {
+					var want map[string]any
+					require.NoError(t, common.UnmarshalJsonStr(payload, &want))
+					found := false
+					for _, line := range strings.Split(writer.Body.String(), "\n") {
+						if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
+							continue
+						}
+						var got map[string]any
+						if common.UnmarshalJsonStr(strings.TrimPrefix(line, "data: "), &got) != nil || got["type"] != want["type"] {
+							continue
+						}
+						response, ok := got["response"].(map[string]any)
+						require.True(t, ok)
+						usage, ok := response["usage"].(map[string]any)
+						require.True(t, ok)
+						delete(usage, "output_tokens_details")
+						if assert.Equal(t, want, got) {
+							found = true
+						}
 					}
-					var got map[string]any
-					if common.UnmarshalJsonStr(strings.TrimPrefix(line, "data: "), &got) != nil || got["type"] != want["type"] {
-						continue
-					}
-					response, ok := got["response"].(map[string]any)
-					require.True(t, ok)
-					usage, ok := response["usage"].(map[string]any)
-					require.True(t, ok)
-					delete(usage, "output_tokens_details")
-					if assert.Equal(t, want, got) {
-						found = true
-					}
+					assert.True(t, found, "terminal event must preserve all upstream fields except the allowed usage patch")
 				}
-				assert.True(t, found, "terminal event must preserve all upstream fields except the allowed usage patch")
 			} else {
 				assert.ErrorIs(t, info.StreamStatus.EndError, writer.writeErr)
 			}
