@@ -119,7 +119,9 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 					}
 				}
 			}
-			sendResponsesStreamData(c, streamResponse, patchResponsesStreamEventUsage(data))
+			if err := helper.ResponseChunkData(c, streamResponse, patchResponsesStreamEventUsage(data)); err != nil {
+				sr.Stop(err)
+			}
 			return
 		}
 		// 事件默认原始透传：typed struct 重序列化会丢失上游字段（如
