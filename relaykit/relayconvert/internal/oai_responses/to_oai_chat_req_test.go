@@ -628,8 +628,8 @@ func TestResponsesRequestToChatCompletionsRequestNamespaceAndAdditionalTools(t *
 	// namespace 内的 custom 也被伪装
 	for _, tool := range got.Tools {
 		if tool.Function.Name == "wait_agent" {
-			params, ok := tool.Function.Parameters.(map[string]any)
-			require.True(t, ok)
+			var params map[string]any
+			require.NoError(t, kitutil.Unmarshal(tool.Function.Parameters, &params))
 			assert.Contains(t, params["required"], "input")
 		}
 	}
@@ -668,8 +668,8 @@ func TestResponsesRequestToChatCompletionsRequestDropsUnsupportedToolTypes(t *te
 	assert.Equal(t, "function", toolSearch.Type)
 	assert.Equal(t, "tool_search", toolSearch.Function.Name)
 	assert.Contains(t, toolSearch.Function.Description, "Search and load Codex tools")
-	params, ok := toolSearch.Function.Parameters.(map[string]any)
-	require.True(t, ok)
+	var params map[string]any
+	require.NoError(t, kitutil.Unmarshal(toolSearch.Function.Parameters, &params))
 	assert.Contains(t, params["required"], "query")
 
 	assert.Equal(t, "exec", got.Tools[1].Function.Name)
