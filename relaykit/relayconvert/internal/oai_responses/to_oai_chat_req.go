@@ -520,7 +520,7 @@ func responsesRequestToolsToChat(raw json.RawMessage, topLevel bool) ([]dto.Tool
 				Function: dto.FunctionRequest{
 					Name:        toolSearchProxyName,
 					Description: "Search and load Codex tools, plugins, connectors, and MCP namespaces for the current task.",
-					Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string","description":"Search query for tools or connectors to load."},"limit":{"type":"integer","description":"Maximum number of tool groups to return."}},"required":["query"]}`),
+					Parameters:  json.RawMessage(`{"type":"object","properties":{"query":{"type":"string","description":"Search query for tools or connectors to load."},"limit":{"type":"integer","description":"Maximum number of tool groups to return."}},"required":["query"]}`),
 				},
 			})
 			continue
@@ -557,7 +557,7 @@ func responsesRequestToolsToChat(raw json.RawMessage, topLevel bool) ([]dto.Tool
 				Function: dto.FunctionRequest{
 					Name:        name,
 					Description: description,
-					Parameters: json.RawMessage(`{"type":"object","properties":{"input":{"type":"string","description":"The complete freeform input for this tool."}},"required":["input"]}`),
+					Parameters:  json.RawMessage(`{"type":"object","properties":{"input":{"type":"string","description":"The complete freeform input for this tool."}},"required":["input"]}`),
 				},
 			})
 			continue
