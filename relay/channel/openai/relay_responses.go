@@ -102,9 +102,8 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		// 检查当前数据是否包含 completed 状态和 usage 信息
 		var streamResponse dto.ResponsesStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
-			// 解析失败时原样透传而不是丢事件（例如 created_at 为浮点的上游），
-			// 仅无法做 usage 记账与补丁；不记 sr 软错误，避免良性透传被
-			// StreamStatus 归入 HasErrors 污染 stream_status 口径。
+			// 合法 JSON 的 DTO 不兼容仍原样透传；真正的协议错误保留软错误，
+			// 避免后续完成事件掩盖异常。
 			logger.LogError(c, common.LogText("failed to unmarshal stream response, relay raw data: %s", err.Error()))
 			if doc := parseResponsesStreamEventDoc(data); doc != nil {
 				if t, _ := doc["type"].(string); isResponsesTerminalEventType(t) {
@@ -118,6 +117,8 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 						responseSnapshot = r
 					}
 				}
+			} else {
+				sr.Error(err)
 			}
 			if err := helper.ResponseChunkData(c, streamResponse, patchResponsesStreamEventUsage(data)); err != nil {
 				sr.Stop(err)
