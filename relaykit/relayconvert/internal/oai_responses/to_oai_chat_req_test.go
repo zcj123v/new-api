@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/codexhistory"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/tidwall/gjson"
 )
 
 func TestResponsesRequestToChatCompletionsRequestInstructionsAndScalarInput(t *testing.T) {
@@ -57,7 +57,7 @@ func TestResponsesRequestToChatCompletionsRequestInstructionsAndScalarInput(t *t
 	assert.Equal(t, "medium", got.ReasoningEffort)
 	assert.Equal(t, `"user-1"`, string(got.User))
 	assert.Equal(t, `false`, string(got.Store))
-	assert.Equal(t, "abc", gjson.GetBytes(got.Metadata, "trace").String())
+	assert.Equal(t, "abc", ojson.GetBytes(got.Metadata, "trace").String())
 }
 
 func TestResponsesRequestToChatCompletionsRequestPreservesQwenThinkingBudget(t *testing.T) {
@@ -84,8 +84,8 @@ func TestResponsesRequestToChatCompletionsRequestPreservesQwenThinkingBudget(t *
 			encoded, err := kitutil.Marshal(got)
 			require.NoError(t, err)
 
-			assert.True(t, gjson.GetBytes(encoded, "enable_thinking").Bool())
-			value := gjson.GetBytes(encoded, "thinking_budget")
+			assert.True(t, ojson.GetBytes(encoded, "enable_thinking").Bool())
+			value := ojson.GetBytes(encoded, "thinking_budget")
 			assert.True(t, value.Exists())
 			assert.Equal(t, tt.want, value.Int())
 		})
@@ -148,11 +148,11 @@ func TestResponsesRequestToChatCompletionsRequestWrapsStringImageURL(t *testing.
 	raw, err := kitutil.Marshal(got)
 	require.NoError(t, err)
 
-	assert.True(t, gjson.GetBytes(raw, "messages.0.content.1.image_url").IsObject(),
+	assert.True(t, ojson.GetBytes(raw, "messages.0.content.1.image_url").IsObject(),
 		"string image_url must be wrapped into an object for chat upstreams")
-	assert.Equal(t, "data:image/png;base64,AAAA", gjson.GetBytes(raw, "messages.0.content.1.image_url.url").String())
-	assert.Equal(t, "low", gjson.GetBytes(raw, "messages.0.content.1.image_url.detail").String())
-	assert.Equal(t, "https://example.test/b.png", gjson.GetBytes(raw, "messages.0.content.2.image_url.url").String())
+	assert.Equal(t, "data:image/png;base64,AAAA", ojson.GetBytes(raw, "messages.0.content.1.image_url.url").String())
+	assert.Equal(t, "low", ojson.GetBytes(raw, "messages.0.content.1.image_url.detail").String())
+	assert.Equal(t, "https://example.test/b.png", ojson.GetBytes(raw, "messages.0.content.2.image_url.url").String())
 }
 
 func TestResponsesRequestToChatCompletionsRequestAssistantTextAndFunctionCallCoexist(t *testing.T) {
@@ -252,7 +252,7 @@ func TestResponsesRequestToChatCompletionsRequestToolsToolChoiceAndTextFormat(t 
 	assert.Equal(t, "function", got.Tools[0].Type)
 	assert.Equal(t, "lookup", got.Tools[0].Function.Name)
 	assert.Equal(t, "Lookup data", got.Tools[0].Function.Description)
-	assert.Equal(t, "object", gjson.GetBytes(got.Tools[0].Function.Parameters, "type").String())
+	assert.Equal(t, "object", ojson.GetBytes(got.Tools[0].Function.Parameters, "type").String())
 	assert.Equal(t, map[string]any{
 		"type": "function",
 		"function": map[string]any{
@@ -261,8 +261,8 @@ func TestResponsesRequestToChatCompletionsRequestToolsToolChoiceAndTextFormat(t 
 	}, got.ToolChoice)
 	require.NotNil(t, got.ResponseFormat)
 	assert.Equal(t, "json_schema", got.ResponseFormat.Type)
-	assert.Equal(t, "answer", gjson.GetBytes(got.ResponseFormat.JsonSchema, "name").String())
-	assert.True(t, gjson.GetBytes(got.ResponseFormat.JsonSchema, "strict").Bool())
+	assert.Equal(t, "answer", ojson.GetBytes(got.ResponseFormat.JsonSchema, "name").String())
+	assert.True(t, ojson.GetBytes(got.ResponseFormat.JsonSchema, "strict").Bool())
 }
 
 func TestResponsesRequestToChatCompletionsRequestCustomToolCallDisguisedAsFunction(t *testing.T) {
