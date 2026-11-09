@@ -335,6 +335,7 @@ func TestApplyResponsesReasoningText(t *testing.T) {
 			require.Equal(t, tt.want, texts)
 		})
 	}
+}
 
 // Synthetic shapes reproduced against DeepSeek's native Responses endpoint on
 // 2026-10-28; see also https://github.com/yetone/magpie/issues/1822.
